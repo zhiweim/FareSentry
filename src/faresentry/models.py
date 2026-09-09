@@ -29,10 +29,11 @@ class TripQuery(BaseModel):
 
 
 class FlightOption(BaseModel):
-    """An itinerary summary; price and metrics cover the returned option.
+    """An outbound choice with a round-trip price, not a complete itinerary.
 
-    Providers must use the same journey scope when comparing options.
-    Duration includes layovers, and stops counts intermediate connections.
+    Route, flights, duration, stops, and layovers describe the outbound only.
+    Duration includes layovers. Return flights have not been selected; the
+    departure token allows a later lookup of compatible return choices.
     """
 
     airline: str = Field(min_length=1)
@@ -40,3 +41,9 @@ class FlightOption(BaseModel):
     currency: CurrencyCode = "USD"
     stops: int = Field(ge=0)
     duration_minutes: int = Field(gt=0)
+    airlines: list[str] = Field(default_factory=list)
+    flight_numbers: list[str] = Field(default_factory=list)
+    origin: AirportCode | None = None
+    destination: AirportCode | None = None
+    max_layover_minutes: int | None = Field(default=None, ge=0)
+    departure_token: str | None = Field(default=None, repr=False)
