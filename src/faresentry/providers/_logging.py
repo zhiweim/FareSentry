@@ -3,11 +3,18 @@
 import logging
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from urllib.parse import quote, quote_plus
 
 # Match query parameters as well as dictionary/debug representations.
-_API_KEY = re.compile(
-    r"""(?i)(\bapi_key['"]?\s*[:=]\s*)(?:'[^']*'|"[^"]*"|[^&\s'"\)\]}>,]+)"""
+_CREDENTIAL_PARAMETER = re.compile(
+    r"""(?i)(\b(?:api_key|departure_token)['"]?\s*[:=]\s*)"""
+    r"""(?:'[^']*'|"[^"]*"|[^&\s'"\)\]}>,]+)"""
+)
+_ACTIVE_SECRETS: ContextVar[tuple[str, ...]] = ContextVar(
+    "transport_secrets", default=()
 )
 _URL_LOGGERS = (
     "urllib3",
@@ -23,17 +30,22 @@ _URL_LOGGERS = (
 
 def _redact(text: str) -> str:
     # Read at emission time rather than keeping credentials in a filter object.
-    secret = os.environ.get("SERPAPI_API_KEY", "").strip()
-    if secret:
-        variants = {
-            secret,
-            quote(secret, safe=""),
-            quote_plus(secret),
-            repr(secret)[1:-1],
-        }
-        for value in sorted(variants, key=len, reverse=True):
-            text = text.replace(value, "REDACTED")
-    return _API_KEY.sub(r"\1REDACTED", text)
+    secrets = (*_ACTIVE_SECRETS.get(), os.environ.get("SERPAPI_API_KEY", "").strip())
+    variants: set[str] = set()
+    for secret in secrets:
+        if not secret:
+            continue
+        variants.update(
+            {
+                secret,
+                quote(secret, safe=""),
+                quote_plus(secret),
+                repr(secret)[1:-1],
+            }
+        )
+    for value in sorted(variants, key=len, reverse=True):
+        text = text.replace(value, "REDACTED")
+    return _CREDENTIAL_PARAMETER.sub(r"\1REDACTED", text)
 
 
 class _CredentialFilter(logging.Filter):
@@ -64,3 +76,20 @@ def protect_transport_logs() -> None:
         logging.getLogger(name).addFilter(_FILTER)
     for name in _URL_LOGGERS:
         logging.getLogger(f"requests.packages.{name}").addFilter(_FILTER)
+
+
+@contextmanager
+def redact_transport_secrets(*secrets: str | None) -> Iterator[None]:
+    """Redact bare/encoded secrets during a request without retaining tokens.
+
+    Context-local state isolates concurrent requests; parameter-based redaction
+    remains active after the scope ends, including for delayed URL log messages.
+    """
+    protect_transport_logs()
+    state = _ACTIVE_SECRETS.set(
+        (*_ACTIVE_SECRETS.get(), *(secret for secret in secrets if secret))
+    )
+    try:
+        yield
+    finally:
+        _ACTIVE_SECRETS.reset(state)

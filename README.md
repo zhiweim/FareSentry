@@ -2,7 +2,8 @@
 
 A personalized flight-shopping agent for the Agents for Humans hackathon.
 MVP-001 retrieves real outbound flight choices from SerpApi Google Flights and
-normalizes them into domain models. Return-flight selection, the Strands agent,
+normalizes them into domain models. A selected outbound choice can now retrieve
+compatible return options as completed round-trip itineraries. The Strands agent,
 persistence, frontend, notifications, and AWS infrastructure are not implemented.
 
 ## Local setup (Windows PowerShell)
@@ -42,17 +43,19 @@ unmocked Requests calls. They never make real SerpApi requests.
 pyproject.toml                 Dependencies, packaging, pytest and Ruff settings
 src/faresentry/
     __init__.py
-    models.py                 TripQuery and FlightOption Pydantic models
+    models.py                 Trip queries, outbound choices, and typed itineraries
     providers/
         __init__.py
-        base.py               FlightProvider protocol: search(query)
+        base.py               FlightProvider protocol: search and return lookup
         serpapi.py            SerpApi retrieval and defensive normalization
 scripts/
     search_flights.py         Manual real-data smoke test
 tests/
     conftest.py               Block real HTTP requests during unit tests
     test_models.py            Domain validation tests
+    test_itineraries.py       Segment, connection, and round-trip model tests
     test_providers.py         Mocked request, parsing, and error tests
+    test_return_options.py    Return lookup, complete itineraries, and pricing tests
     test_search_flights.py    Smoke-test CLI validation and output tests
 ```
 
@@ -65,25 +68,60 @@ outbound dates, and the airports must differ.
 It does not contain a selected return itinerary. Route, flight numbers, duration,
 stops, and layover metrics describe only the outbound journey. This matches the
 [initial Google Flights response](https://serpapi.com/google-flights-api): its
-`departure_token` can later retrieve compatible return choices. This milestone
-preserves that token but never uses it to fetch returns.
+`departure_token` retrieves compatible return choices when the caller explicitly
+selects an outbound option for return lookup.
 
-The existing `airline` field remains a display string (multiple airlines joined
-with ` / `). Added fields are `airlines`, `flight_numbers`, `origin`,
-`destination`, `max_layover_minutes`, and `departure_token`, with defaults that
-keep existing callers compatible. Prices use `Decimal`; total duration comes
-from SerpApi's `total_duration`, including layovers. Python calculates stops as
-the outbound segment count minus one, and maximum layover from the supplied
-layover durations. Nonstop options have a maximum layover of zero; incomplete
-connecting-flight layover data is `None`, not zero. Missing optional text is
-unknown or an empty list; unavailable airline names display as `Unknown airline`.
+Each `FlightOption` retains a required, immutable `outbound: FlightItinerary`,
+with ordered `FlightSegment` objects and one explicit connection between each
+pair. Same-airport connections are `Layover` objects; airport changes are
+`AirportTransfer` objects. The provider uses adjacent segment airport IDs for
+connection endpoints and the corresponding API layover duration for the entire
+connection interval. It never infers missing durations from local timestamps.
+
+Existing summary attributes remain readable: `airline` (names joined with
+` / `), `airlines`, `flight_numbers`, `origin`, `destination`, `duration_minutes`,
+`stops`, and `max_layover_minutes`. They are derived from `outbound`, including
+airport transfers in duration and maximum connection time. Nonstop options have
+zero stops and a maximum layover of zero. Price remains a `Decimal` round-trip
+quote; `currency` and the repr-hidden `departure_token` stay on the search choice.
+The token is workflow state and is absent from the itinerary itself.
+
+Code constructing options must now pass `outbound` instead of summary fields;
+summary-only input cannot reconstruct the individual flights and connections.
+Serialized options contain `outbound`, `price`, `currency`, and `departure_token`,
+without duplicated summary values. Treat serialized options as internal workflow
+data because they include the lookup token. The CLI's readable output is unchanged.
 
 `FlightProvider.search()` returns only normalized `FlightOption` objects,
 combining `best_flights` followed by `other_flights`. Missing result groups and
 zero results produce an empty list. Unusable individual results (for example,
-missing price or duration, or malformed segments) are skipped independently.
-Missing optional metadata is retained as unknown where possible. If every result
-is malformed, the returned list is empty. No raw API dictionaries are returned.
+missing price, segment airports, airline, flight number, or duration) are skipped
+independently. Connecting options also require exactly one valid connection
+duration per segment gap; supplied connection airport IDs must agree with the
+adjacent flights. The sum of flight and connection durations must match
+`total_duration`. Incomplete or inconsistent results are skipped rather than
+filled with invented data. Missing lookup tokens remain `None`. If every result
+is malformed, the returned list is empty. No raw API dictionaries are retained.
+
+Use `provider.get_return_options(selected_option, original_query)` to retrieve
+completed `RoundTripItinerary` objects. Pass the unchanged `TripQuery` used for
+`search()`: the provider resends its original departure/arrival airports and both
+dates, with the same round-trip, economy, USD, and locale settings, plus the
+selected option's token. It checks airport and currency agreement before making
+the request. Dates are not stored in `FlightOption`, so callers are responsible
+for retaining and supplying the original query. A missing or blank token raises
+`FlightProviderError` without making a request.
+
+Return choices use the same segment/connection normalizer as outbound choices.
+Each completed itinerary preserves the selected outbound and adds one inbound.
+Its `total_price` comes from that return result's `price`, which SerpApi's
+[returning-flight example](https://serpapi.com/google-flights-results) labels as
+a round-trip fare. It is neither added to the initial quote nor replaced by it.
+Missing or invalid prices, contradictory trip types, malformed itineraries, and
+return routes that do not reverse the outbound endpoints are skipped individually.
+Both result groups are combined; no usable returns produces `[]`. Completed
+itineraries contain no departure or booking tokens and retain no raw API data.
+The outbound CLI remains a single-search tool; it does not perform return lookup.
 
 The provider reads `SERPAPI_API_KEY` from the environment at search time. Requests
 use round trip (`type=1`), economy (`travel_class=1`), USD, English, and US locale.
@@ -96,14 +134,18 @@ printed or logged.
 Before sending a search, the provider installs a credential-redacting filter on
 Requests and urllib3 transport loggers, including `urllib3.connectionpool` and
 `urllib3.util.retry` (and legacy Requests-vendored equivalents). It redacts
-`api_key` values and literal/URL-encoded copies of the current key in messages
-and exception text before handlers receive the record. Logging levels and
+`api_key` and `departure_token` parameter values in messages and exception text
+before handlers receive the record. Request-scoped context also redacts bare and
+URL-encoded copies of the active key and token, including echoed exception text.
+That context is cleared on success or failure and isolates concurrent requests.
+Logging levels and
 application logging stay unchanged, and repeated searches reuse the filter.
 The real outgoing query parameter is unchanged. Tests exercise the real
 Requests/urllib3 logging path with a mocked connection and blocked sockets/DNS.
 
 Redaction is an output safeguard, not memory isolation: the environment,
-request URL, and debugger-visible locals still contain the key. Developer tools
+request URL, and debugger-visible locals still contain credentials. Lookup tokens
+also remain in the selected `FlightOption` and its internal serialization. Developer tools
 that inspect those objects, dump process memory, or enable `http.client` raw
 wire output bypass these logging filters. Keep such captures private; do not
 print or log raw request objects through unrelated application loggers.
