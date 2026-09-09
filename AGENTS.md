@@ -79,3 +79,24 @@ Do NOT implement yet:
 - Use pytest for meaningful unit tests.
 - Prefer simple code over premature abstractions.
 - Run tests after implementing a feature.
+
+## Windows development environment
+
+Development is on Windows using PowerShell.
+
+The project virtual environment is `.venv`.
+
+When running Python-related commands, prefer invoking the virtual environment
+explicitly rather than assuming it is activated:
+
+- `.\.venv\Scripts\python.exe`
+- `.\.venv\Scripts\python.exe -m pytest`
+- `.\.venv\Scripts\python.exe -m pip`
+- `.\.venv\Scripts\python.exe -m ruff`
+
+Do not use Unix commands such as:
+- `source .venv/bin/activate`
+- `.venv/bin/python`
+
+If `.venv` does not exist, create it using the project-local Python version
+configured by pyenv before installing dependencies.
