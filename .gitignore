@@ -1,4 +1,5 @@
 .venv/
+.venv-python314-backup/
 .env
 __pycache__/
 .pytest_cache/
@@ -6,3 +7,6 @@ __pycache__/
 *.db
 *.sqlite3
 .DS_Store
+*.egg-info/
+build/
+dist/
