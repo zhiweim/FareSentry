@@ -5,7 +5,14 @@ import os
 import requests
 from pydantic import ValidationError
 
-from faresentry.models import FlightOption, TripQuery
+from faresentry.models import (
+    AirportTransfer,
+    FlightItinerary,
+    FlightOption,
+    FlightSegment,
+    Layover,
+    TripQuery,
+)
 from faresentry.providers._logging import protect_transport_logs
 from faresentry.providers.base import FlightProviderError
 
@@ -95,20 +102,6 @@ def _airport_id(value: object) -> str | None:
     return _text(value.get("id")) if isinstance(value, dict) else None
 
 
-def _max_layover(value: object, stops: int) -> int | None:
-    if stops == 0:
-        return 0
-    if not isinstance(value, list) or len(value) != stops:
-        return None
-    durations: list[int] = []
-    for layover in value:
-        duration = layover.get("duration") if isinstance(layover, dict) else None
-        if type(duration) is not int or duration < 0:
-            return None
-        durations.append(duration)
-    return max(durations)
-
-
 def _normalize(result: object) -> FlightOption | None:
     if not isinstance(result, dict):
         return None
@@ -121,28 +114,59 @@ def _normalize(result: object) -> FlightOption | None:
     if any(not isinstance(flight, dict) or not flight for flight in flights):
         return None
 
-    airlines = list(
-        dict.fromkeys(
-            airline for flight in flights if (airline := _text(flight.get("airline")))
-        )
-    )
-    flight_numbers = [
-        number for flight in flights if (number := _text(flight.get("flight_number")))
-    ]
-    stops = len(flights) - 1
+    layovers = result.get("layovers", [])
+    if not isinstance(layovers, list) or len(layovers) != len(flights) - 1:
+        return None
     try:
+        segments = tuple(
+            FlightSegment.model_validate(
+                {
+                    "origin": _airport_id(flight.get("departure_airport")),
+                    "destination": _airport_id(flight.get("arrival_airport")),
+                    "airline": _text(flight.get("airline")),
+                    "flight_number": _text(flight.get("flight_number")),
+                    "duration_minutes": flight.get("duration"),
+                }
+            )
+            for flight in flights
+        )
+        connections: list[Layover | AirportTransfer] = []
+        for previous, following, layover in zip(segments, segments[1:], layovers):
+            if not isinstance(layover, dict):
+                return None
+            arrival, departure = previous.destination, following.origin
+            # The ordered flights supply both endpoints. If a connection airport
+            # is also supplied, it must agree with one of those endpoints.
+            if "id" in layover and _airport_id(layover) not in (arrival, departure):
+                return None
+            if arrival == departure:
+                connections.append(
+                    Layover.model_validate(
+                        {
+                            "airport": arrival,
+                            "duration_minutes": layover.get("duration"),
+                        }
+                    )
+                )
+            else:
+                connections.append(
+                    AirportTransfer.model_validate(
+                        {
+                            "arrival_airport": arrival,
+                            "departure_airport": departure,
+                            "duration_minutes": layover.get("duration"),
+                        }
+                    )
+                )
+        outbound = FlightItinerary(segments=segments, layovers=tuple(connections))
+        # Never invent connection time or keep two contradictory duration values.
+        if outbound.duration_minutes != result["total_duration"]:
+            return None
         return FlightOption.model_validate(
             {
-                "airline": " / ".join(airlines) or "Unknown airline",
-                "airlines": airlines,
-                "flight_numbers": flight_numbers,
-                "origin": _airport_id(flights[0].get("departure_airport")),
-                "destination": _airport_id(flights[-1].get("arrival_airport")),
+                "outbound": outbound,
                 "price": result.get("price"),
                 "currency": "USD",
-                "duration_minutes": result.get("total_duration"),
-                "stops": stops,
-                "max_layover_minutes": _max_layover(result.get("layovers"), stops),
                 "departure_token": _text(result.get("departure_token")),
             }
         )

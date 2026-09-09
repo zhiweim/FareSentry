@@ -85,17 +85,18 @@ def test_completed_round_trip_keeps_directions_and_total_price_separate(
     assert "departure_token" not in trip.model_dump_json()
 
 
-def test_incomplete_choice_remains_backwards_compatible(
+def test_incomplete_choice_preserves_price_and_summary_behavior(
     outbound: FlightItinerary,
 ) -> None:
     option = FlightOption(
-        airline="United / ANA",
+        outbound=outbound,
         price=Decimal("900.25"),
-        stops=1,
-        duration_minutes=870,
         departure_token="synthetic-workflow-token",
     )
     assert option.price == Decimal("900.25")
+    assert option.airline == "United / ANA"
+    assert option.stops == 1
+    assert option.duration_minutes == 870
     assert option.departure_token == "synthetic-workflow-token"
     assert option.departure_token not in repr(option)
     assert not isinstance(option, (FlightItinerary, RoundTripItinerary))

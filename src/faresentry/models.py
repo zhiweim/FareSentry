@@ -207,22 +207,52 @@ class FlightOption(BaseModel):
     departure token allows a later lookup of compatible return choices.
     """
 
-    airline: str = Field(min_length=1)
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    outbound: FlightItinerary
     price: Decimal = Field(
         ge=0,
         allow_inf_nan=False,
         description="Quoted total round-trip price; the return has not been selected.",
     )
     currency: CurrencyCode = "USD"
-    stops: int = Field(ge=0)
-    duration_minutes: int = Field(gt=0)
-    airlines: list[str] = Field(default_factory=list)
-    flight_numbers: list[str] = Field(default_factory=list)
-    origin: AirportCode | None = None
-    destination: AirportCode | None = None
-    max_layover_minutes: int | None = Field(default=None, ge=0)
     departure_token: str | None = Field(
         default=None,
         repr=False,
         description="Opaque provider workflow state retained for return lookup.",
     )
+
+    @property
+    def airline(self) -> str:
+        return " / ".join(self.airlines)
+
+    @property
+    def airlines(self) -> list[str]:
+        return self.outbound.airlines
+
+    @property
+    def flight_numbers(self) -> list[str]:
+        return self.outbound.flight_numbers
+
+    @property
+    def origin(self) -> str:
+        return self.outbound.origin
+
+    @property
+    def destination(self) -> str:
+        return self.outbound.destination
+
+    @property
+    def duration_minutes(self) -> int:
+        return self.outbound.duration_minutes
+
+    @property
+    def stops(self) -> int:
+        return self.outbound.stops
+
+    @property
+    def max_layover_minutes(self) -> int:
+        return max(
+            (connection.duration_minutes for connection in self.outbound.connections),
+            default=0,
+        )

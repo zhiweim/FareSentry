@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from faresentry.models import FlightOption
+from faresentry.models import FlightItinerary, FlightOption, FlightSegment
 from faresentry.providers.base import FlightProviderError
 from scripts import search_flights
 
@@ -33,14 +33,18 @@ def test_readable_output_hides_token(
 ) -> None:
     provider.search.return_value = [
         FlightOption(
-            airline="ANA",
+            outbound=FlightItinerary(
+                segments=(
+                    FlightSegment(
+                        origin="LAX",
+                        destination="HND",
+                        airline="ANA",
+                        flight_number="NH 105",
+                        duration_minutes=725,
+                    ),
+                )
+            ),
             price=Decimal("768"),
-            stops=0,
-            duration_minutes=725,
-            origin="LAX",
-            destination="HND",
-            flight_numbers=["NH 105"],
-            max_layover_minutes=0,
             departure_token="do-not-print-this-token",
         )
     ]
