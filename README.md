@@ -3,8 +3,10 @@
 A personalized flight-shopping agent for the Agents for Humans hackathon.
 MVP-001 retrieves real outbound flight choices from SerpApi Google Flights and
 normalizes them into domain models. A selected outbound choice can now retrieve
-compatible return options as completed round-trip itineraries. The Strands agent,
-persistence, frontend, notifications, and AWS infrastructure are not implemented.
+compatible return options as completed round-trip itineraries. A Strands
+recommendation adapter now chooses among acceptable round trips using explicit
+soft preferences and deterministic facts. Persistence, frontend, notifications,
+and AWS infrastructure are not implemented.
 
 ## Local setup (Windows PowerShell)
 
@@ -23,8 +25,61 @@ creating a new one. If `py -3.13` is unavailable, install Python 3.13 with the
 Windows Python launcher, or invoke your Python 3.13 executable by its full path.
 The existing `.python-version` also selects 3.13.0 for pyenv users.
 
-Runtime dependencies are `strands-agents`, `pydantic`, `requests`, and
-`python-dotenv`. The `dev` extra installs `pytest` and `ruff`.
+Runtime dependencies are `strands-agents`, `boto3[crt]`, `pydantic`, `requests`,
+and `python-dotenv`. The `dev` extra installs `pytest` and `ruff`.
+The declared `boto3[crt]>=1.41,<2` dependency enables AWS Common Runtime (CRT)
+support for consuming `aws login` credentials. Strands' plain Boto3 dependency
+does not enable that extra. A normal project install includes the compatible
+CRT package; no separate manual SDK installation is needed.
+
+## Bedrock local setup (Windows PowerShell)
+
+Complete the local setup above first, creating `.venv` only if needed and
+installing the project with `.\.venv\Scripts\python.exe -m pip install -e '.[dev]'`.
+Activation remains optional because every Python command uses `.venv` explicitly.
+Install or update the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+separately; `aws login` requires CLI version 2.32.0 or later. The AWS identity
+must have permission to sign in for local development and invoke the chosen
+Bedrock model. See [Boto3's login prerequisites](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html#login-with-console-credentials).
+
+Run these commands in the same PowerShell session used for the recommendation:
+
+```powershell
+aws --version
+aws login --profile faresentry
+$env:AWS_PROFILE = "faresentry"
+$env:AWS_REGION = "us-west-2"
+$env:FARESENTRY_BEDROCK_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+```
+
+Complete the browser sign-in opened by `aws login`. Boto3 and Strands use the
+selected profile's CLI-managed login session. Repeat `aws login --profile faresentry`
+when the session expires, and set the environment variables again in a new
+PowerShell session. This profile, region, and model configuration was used for
+the successful local Bedrock recommendation smoke test.
+
+Before the first Anthropic invocation, complete the one-time Bedrock use-case
+form for the AWS account. Select an Anthropic model in the Bedrock console model
+catalog and submit use-case details if required. A fresh clone does not require
+resubmission if the account has already completed it. See [Anthropic model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
+
+Do not put AWS credentials in `.env`, source code, or committed files. Use the
+CLI-managed login session; the environment variables above select configuration
+and contain no credentials. The `.env` setup below is for the SerpApi key only.
+
+If an older environment raises `MissingDependencyException` while loading
+`aws login` credentials, reinstall the declared dependencies into the same venv:
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+& .\.venv\Scripts\python.exe -m pip check
+& .\.venv\Scripts\python.exe -c "import boto3, awscrt; print('Boto3 and AWS CRT imports succeeded')"
+```
+
+The import check makes no AWS calls and prints no credentials. Missing CRT
+support caused this error during initial setup; the declared extra prevents
+relying on an unrecorded one-off `pip install "boto3[crt]"` fix. Continue with the
+[recommendation API example](#recommendations) after authentication and model access.
 
 ## Checks
 
@@ -35,7 +90,9 @@ Runtime dependencies are `strands-agents`, `pydantic`, `requests`, and
 ```
 
 Tests use synthetic responses and mocks, require no credentials, and block
-unmocked Requests calls. They never make real SerpApi requests.
+unmocked Requests calls, AWS API calls, and Botocore HTTP (including credential
+metadata). They never make real SerpApi or Bedrock requests. A scripted local
+model also exercises the real Strands structured-output event loop.
 
 ## Structure
 
@@ -44,6 +101,10 @@ pyproject.toml                 Dependencies, packaging, pytest and Ruff settings
 src/faresentry/
     __init__.py
     models.py                 Trip queries, outbound choices, and typed itineraries
+    constraints.py            Deterministic hard-constraint evaluation
+    recommendations.py        Typed candidate summaries, comparisons, output validation
+    agents/
+        recommendation.py     Injectable Strands recommendation adapter
     providers/
         __init__.py
         base.py               FlightProvider protocol: search and return lookup
@@ -57,6 +118,7 @@ tests/
     test_providers.py         Mocked request, parsing, and error tests
     test_return_options.py    Return lookup, complete itineraries, and pricing tests
     test_search_flights.py    Smoke-test CLI validation and output tests
+    test_recommendations.py   Facts, preference validation, and offline agent tests
 ```
 
 `TripQuery` accepts one origin, destination, outbound date, return date, and
@@ -178,5 +240,119 @@ full token or raw JSON. A failed search prints a safe error and exits with code
 1; invalid arguments exit with code 2. A successful search, including no usable
 results, exits with code 0.
 
-Python handles calculations and hard constraints; the future Strands agent will
-reason about tradeoffs and explanations.
+## Recommendations
+
+`TravelerSoftPreferences` supports a preferred stop maximum per direction,
+preferences for shorter total travel and connections, dislike of airport changes,
+preferred airlines, and `none` / `low` / `moderate` / `high` willingness to pay
+more for convenience. These fields never exclude an itinerary. Preferred airline
+matching uses normalized airline labels, ignoring case; it does not resolve aliases.
+
+`build_recommendation_request()` is pure Python. It accepts a mapping of stable,
+unique candidate IDs to already-filtered `RoundTripItinerary` objects, preferences,
+and the active `HardTravelConstraints`. It defensively rechecks every candidate
+with the existing evaluator and rejects the entire request if any candidate fails.
+It also rejects empty sets, inconsistent currencies, and differing endpoints.
+Candidates must come from the same dated search; itinerary models do not carry
+dates, so the caller is responsible for that precondition.
+
+Each typed summary contains the full round-trip price, currency, outbound/inbound
+duration and stops, ordered connections with transfer endpoints and durations,
+airlines and flight numbers, plus convenience totals and preferred-airline matches.
+Python supplies signed comparisons for every ordered pair: price premiums,
+percentages, travel time, stops, connection time, and transfer counts. Percentages
+use the reference price and round half up to two decimal places; a zero reference
+price produces `null`. Decimal prices serialize as strings without float conversion.
+The comparisons grow quadratically, so this interface is intended for a small shortlist.
+
+`StrandsRecommender` creates a fresh agent on each invocation, using no application
+tools and no streaming console callback. Its system prompt limits judgment to
+subjective tradeoffs and tells the model to cite supplied facts without arithmetic,
+hard-constraint evaluation, or future-price predictions. Hard constraints are not
+included in the prompt. Model prose is still subjective output; schema validation
+does not prove that every explanation is factually correct.
+
+Example integration after retrieval and deterministic filtering:
+
+```python
+import os
+
+from strands.models import BedrockModel
+
+from faresentry.agents.recommendation import StrandsRecommender
+from faresentry.models import TravelerSoftPreferences
+
+# accepted_candidates: dict[str, RoundTripItinerary] from one search
+# constraints: the same HardTravelConstraints used when filtering
+preferences = TravelerSoftPreferences(
+    preferred_max_stops_per_direction=1,
+    prefer_shorter_total_travel_time=True,
+    prefer_shorter_connections=True,
+    dislike_airport_transfers=True,
+    preferred_airlines=("Singapore Airlines",),
+    willingness_to_pay_more="moderate",
+)
+model = BedrockModel(
+    model_id=os.environ["FARESENTRY_BEDROCK_MODEL_ID"],
+    region_name=os.environ["AWS_REGION"],
+    temperature=0.2,
+    max_tokens=1500,
+)
+recommendation = StrandsRecommender(model=model).recommend(
+    accepted_candidates, preferences, constraints=constraints
+)
+print(recommendation.model_dump_json(indent=2))
+```
+
+The caller selects a Bedrock model supporting structured output through tool use
+and configures AWS credentials through environment variables or the standard AWS
+credential chain. This example performs a live, billable model invocation; tests
+inject an agent factory or a scripted SDK model instead. The adapter also accepts
+an explicit model ID or another Strands `Model`. There is no hard-coded model ID,
+credential, region, or import-time AWS client initialization. The minimum Strands
+version is 1.55, matching the SDK version validated locally. See the official
+[Strands structured-output documentation](https://strandsagents.com/docs/user-guide/concepts/agents/structured-output/).
+
+The result is a `Recommendation` with `selected_candidate_id`, display-only
+`recommendation`, one to six typed `key_tradeoffs`, and `low` / `medium` / `high`
+`confidence` describing strength of fit, not a calibrated probability. Each
+`RecommendationTradeoff` contains:
+
+- `category`: `price`, `total_travel_time`, `stops`, `connections`,
+  `airport_transfer`, `airline_preference`, or `overall_value`.
+- `candidate_ids`: one or more distinct supplied candidates discussed in that judgment.
+- `favored_candidate_id`: a discussed candidate, or `null` when none is favored
+  on that dimension (for example a tie or no preference).
+- `explanation`: concise display-only text.
+
+An individual dimension may favor an alternative: a price judgment can favor
+`budget` while the final selection is `direct`. `overall_value` is the final
+synthesis across preferences; if included, it must favor `selected_candidate_id`.
+The selected ID is the sole authoritative final recommendation target.
+
+Every structured candidate reference must belong to the current request.
+`parse_recommendation()` performs this membership validation after Pydantic checks
+categories and reference relationships, even if the SDK returned nested Pydantic
+objects. The Strands adapter always uses this boundary before returning a result.
+String-only tradeoffs are no longer supported.
+
+Downstream decision logic **must use structured fields**, never extract candidate
+IDs, judgments, or facts from `recommendation` or `explanation` text. These strings
+are for display and are not validated for factual correctness; even an invented
+name in prose has no machine-readable meaning. Obtain objective numbers from the
+deterministic request summaries/comparisons, not model explanations. For example:
+
+```python
+selected_trip = accepted_candidates[recommendation.selected_candidate_id]
+price_judgments = [
+    tradeoff
+    for tradeoff in recommendation.key_tradeoffs
+    if tradeoff.category == "price"
+]
+# Each judgment exposes candidate_ids and favored_candidate_id directly.
+```
+
+Invalid input raises `ValueError`; malformed output or an unknown structured
+ID raises `InvalidRecommendationError`; other SDK/provider failures raise
+`RecommendationError`. Both recommendation errors have safe display messages.
+There is no fallback selection on failure and no price history or alert decision.

@@ -27,6 +27,103 @@ ConstraintType = Literal[
 ]
 
 
+class TravelerSoftPreferences(BaseModel):
+    """Subjective priorities; none of these fields excludes an itinerary.
+
+    Willingness to pay more is qualitative, not a budget or a price limit.
+    Airline names should use the same labels as the normalized itineraries.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    preferred_max_stops_per_direction: int | None = Field(
+        default=None, ge=0, strict=True
+    )
+    prefer_shorter_total_travel_time: bool = Field(default=True, strict=True)
+    prefer_shorter_connections: bool = Field(default=True, strict=True)
+    dislike_airport_transfers: bool = Field(default=True, strict=True)
+    preferred_airlines: tuple[FlightLabel, ...] = ()
+    willingness_to_pay_more: Literal["none", "low", "moderate", "high"] = "moderate"
+
+
+JudgmentCategory = Literal[
+    "price",
+    "total_travel_time",
+    "stops",
+    "connections",
+    "airport_transfer",
+    "airline_preference",
+    "overall_value",
+]
+
+
+class RecommendationTradeoff(BaseModel):
+    """Typed subjective reasoning; explanation is for display only.
+
+    candidate_ids names the distinct candidates discussed. A null favored ID
+    means no candidate is favored on this dimension (e.g. a tie or no preference).
+    overall_value represents the final synthesis; other categories may favor an
+    alternative to the final selection. Request membership is checked separately.
+    Downstream decisions must use these structured fields, never parse explanation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    category: JudgmentCategory
+    candidate_ids: tuple[FlightLabel, ...] = Field(min_length=1)
+    favored_candidate_id: FlightLabel | None = Field(
+        description="A discussed candidate, or null when none is favored."
+    )
+    explanation: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)
+    ] = Field(description="Display-only explanation; never parse for decision logic.")
+
+    @model_validator(mode="after")
+    def validate_references(self) -> Self:
+        if len(set(self.candidate_ids)) != len(self.candidate_ids):
+            raise ValueError("Tradeoff candidate IDs must be distinct")
+        if (
+            self.favored_candidate_id is not None
+            and self.favored_candidate_id not in self.candidate_ids
+        ):
+            raise ValueError("Favored candidate must be among the discussed candidates")
+        return self
+
+
+class Recommendation(BaseModel):
+    """Subjective choice among supplied candidates, never a constraint decision.
+
+    Confidence describes strength of preference, not a calibrated probability
+    or a prediction of future fares. Candidate membership is checked separately.
+    selected_candidate_id is the authoritative final target; any overall_value
+    tradeoff must agree. Decisions consume typed tradeoffs, selection and confidence.
+    recommendation and tradeoff explanations are display-only, never decision inputs.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    selected_candidate_id: FlightLabel
+    recommendation: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)
+    ] = Field(
+        description="Display-only recommendation; never parse for decision logic."
+    )
+    key_tradeoffs: tuple[RecommendationTradeoff, ...] = Field(
+        min_length=1, max_length=6
+    )
+    confidence: Literal["low", "medium", "high"]
+
+    @model_validator(mode="after")
+    def validate_final_target(self) -> Self:
+        for tradeoff in self.key_tradeoffs:
+            if (
+                tradeoff.category == "overall_value"
+                and tradeoff.favored_candidate_id != self.selected_candidate_id
+            ):
+                raise ValueError("Overall value must favor the selected candidate")
+        return self
+
+
 class HardTravelConstraints(BaseModel):
     """Inclusive limits applied independently to both directions.
 

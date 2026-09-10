@@ -9,7 +9,8 @@ description = "A personalized flight-shopping agent"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "strands-agents>=1.0,<2",
+    "strands-agents>=1.55,<2",
+    "boto3[crt]>=1.41,<2",
     "pydantic>=2.0,<3",
     "requests>=2.32,<3",
     "python-dotenv>=1.0,<2",
