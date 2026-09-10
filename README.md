@@ -704,4 +704,82 @@ same-itinerary price, watch low, and watch average. No long-lived transaction sp
 provider or model work. No raw responses, tokens, or credentials enter history.
 For deterministic tests, inject `clock=lambda: aware_datetime`; it is called once
 per valid check. Tests use scripted dependencies and temporary SQLite files,
-with real HTTP and AWS calls blocked. This API performs no scheduling or delivery.
+with real HTTP and AWS calls blocked. This one-cycle API performs no scheduling or delivery.
+
+## Local watch scheduling
+
+`faresentry.scheduling.MonitoringScheduler` determines when to call the existing
+monitoring cycle. Supply a fixed list of `ScheduledWatch` models containing the
+existing `FareWatch` query, constraints, preferences, alert policy, `enabled` flag,
+positive `check_interval` (`timedelta`), and `max_return_lookups` (default 3).
+SQLite stores query/run history but does not store this full configuration; the
+caller supplies it in Python for the local demo. Recreate the scheduler to load
+changed configuration. Duplicate watch identities are rejected before execution.
+
+A watch is due when enabled and either no monitoring run exists or elapsed UTC
+time since its latest run's creation is at least its check interval. Cadence uses
+**attempt time**, including incomplete, failed, empty, and manually initiated
+runs. It uses `SQLiteFareHistory.get_latest_run()`, ordered by timestamp then run
+ID, without changing schema v3. This is separate from alert history, which still
+excludes incomplete runs. Long downtime produces one check, not a catch-up burst.
+
+Using the configured `query`, `constraints`, `preferences`, `provider`, `history`,
+and `model` from the preceding examples:
+
+```python
+from datetime import timedelta
+
+from faresentry.scheduling import MonitoringScheduler, ScheduledWatch
+
+scheduled_watch = ScheduledWatch(
+    watch=FareWatch.from_query(query),
+    constraints=constraints,
+    preferences=preferences,
+    policy=AlertPolicy(
+        currency=query.currency,
+        first_observation="suppress",
+        minimum_absolute_improvement="100",
+    ),
+    enabled=True,
+    check_interval=timedelta(hours=6),
+    max_return_lookups=3,
+)
+scheduler = MonitoringScheduler(
+    [scheduled_watch],
+    history=history,
+    provider=provider,
+    recommender=StrandsRecommender(model=model),
+)
+
+# One scheduling pass:
+batch = scheduler.run_due_watches()
+print(batch.model_dump_json(indent=2))
+
+# Optional local loop; consume results as they arrive. Ctrl+C stops it.
+for batch in scheduler.poll(poll_interval_seconds=60):
+    print(batch.model_dump_json(indent=2))
+```
+
+Each pass examines watches in configuration order and invokes `run_monitoring_cycle()`
+once for each due watch. The **60-second poll delay** is separate from the
+**6-hour watch cadence**: non-due and disabled watches make no provider/model calls.
+The loop is sequential and sleeps after each consumed pass. Pass results contain
+examined/skipped/succeeded/failed counts and per-watch outcomes (`disabled`,
+`not_due`, `succeeded`, or `failed`). Successful outcomes embed the existing
+`MonitoringRunResult`, including normal empty results and any `AlertDecision`.
+
+A failing watch produces a `failed` outcome with `failure.stage` (`history` or
+`monitoring`) and `failure.error_type`; other due watches continue. Raw exception
+strings are not included. Provider/model failures normally leave a persisted
+incomplete attempt, so subsequent polls and scheduler restarts respect its cadence.
+A small process-local attempt guard also waits one check interval after failures
+that prevent history access or run creation. Restarting clears that fallback when
+no run could be persisted. Keyboard interrupts propagate normally.
+
+Use one scheduler instance and one sequential loop per database. Multiple concurrent
+schedulers, distributed locking, cron expressions, advanced retries, and persistent
+user configuration are deferred. Tests inject `clock`, a scripted `monitoring_cycle`,
+and/or provider/recommender fakes. `poll(sleep=fake_sleep, max_polls=4)` bounds polling
+without real waiting; `max_polls=0` performs no passes. Existing HTTP/AWS blockers
+remain active. Notification delivery and deployment are not implemented; even a
+true `should_alert` is only returned in the result.

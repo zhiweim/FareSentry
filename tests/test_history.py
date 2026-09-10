@@ -1029,3 +1029,25 @@ def test_database_rejects_invalid_completion_marker(
         assert connection.execute(
             "SELECT completed FROM monitoring_runs"
         ).fetchone() == (0,)
+
+
+def test_latest_run_uses_attempt_order_and_watch_scope(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    assert repository.get_latest_run(watch) is None
+    repository.record_observation(watch, fare(), observed_at=START)
+    assert repository.get_latest_run(watch) is None  # Legacy rows are not attempts.
+    first = repository.create_run(watch, observed_at=START)
+    repository.mark_run_completed(watch, run=first)
+    assert repository.get_latest_run(watch) == first
+    tied = repository.create_run(watch, observed_at=START)
+    assert repository.get_latest_run(watch) == tied  # Includes incomplete empty runs.
+    future = repository.create_run(watch, observed_at=START + timedelta(days=1))
+    repository.create_run(watch, observed_at=START - timedelta(days=1))
+    other = FareWatch.model_validate(
+        watch.model_dump() | {"outbound_date": "2026-12-02"}
+    )
+    repository.create_run(other, observed_at=START + timedelta(days=2))
+    reopened = SQLiteFareHistory(repository.database_path)
+    assert reopened.get_latest_run(watch) == future
+    assert reopened.get_prior_observations(watch, before_run=future) == []

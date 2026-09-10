@@ -203,6 +203,22 @@ class SQLiteFareHistory:
                 (run.run_id,),
             )
 
+    def get_latest_run(self, watch: FareWatch) -> MonitoringRun | None:
+        """Latest attempt by (UTC timestamp, run ID), regardless of completion.
+
+        Scheduling uses attempts, including empty or failed checks, to avoid
+        immediate retries. Alert references must still use get_prior_observations.
+        Legacy ungrouped observations are not monitoring attempts.
+        """
+        watch = FareWatch.model_validate(watch.model_dump())
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT run_id, watch_id, observed_at FROM monitoring_runs
+                   WHERE watch_id = ? ORDER BY observed_at DESC, run_id DESC LIMIT 1""",
+                (watch.watch_id,),
+            ).fetchone()
+        return MonitoringRun.model_validate(dict(row)) if row is not None else None
+
     def record_observation(
         self,
         watch: FareWatch,
