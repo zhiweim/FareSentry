@@ -18,7 +18,7 @@ from faresentry.history import (
 )
 from faresentry.models import FlightItinerary, RoundTripItinerary
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SQLiteFareHistory:
@@ -53,8 +53,10 @@ class SQLiteFareHistory:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == SCHEMA_VERSION:
                 return
-            if version == 1:
-                self._migrate_v1_to_v2(connection)
+            if version in (1, 2):
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
+                self._migrate_v2_to_v3(connection)
                 return
             if version != 0:
                 raise ValueError(f"Unsupported fare-history schema version: {version}")
@@ -94,6 +96,7 @@ class SQLiteFareHistory:
             )
             connection.execute("PRAGMA user_version = 1")
             self._migrate_v1_to_v2(connection)
+            self._migrate_v2_to_v3(connection)
 
     @staticmethod
     def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -135,6 +138,16 @@ class SQLiteFareHistory:
         connection.execute("PRAGMA user_version = 2")
 
     @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        """Preserve existing run history; future runs default to incomplete."""
+        connection.execute(
+            """ALTER TABLE monitoring_runs ADD COLUMN completed
+               INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))"""
+        )
+        connection.execute("UPDATE monitoring_runs SET completed = 1")
+        connection.execute("PRAGMA user_version = 3")
+
+    @staticmethod
     def _record_watch(connection: sqlite3.Connection, watch: FareWatch) -> None:
         connection.execute(
             """INSERT INTO watches (watch_id, context_json, currency)
@@ -143,7 +156,7 @@ class SQLiteFareHistory:
         )
 
     def create_run(self, watch: FareWatch, *, observed_at: datetime) -> MonitoringRun:
-        """Create one distinct check; callers reuse its result for all its fares.
+        """Create one incomplete check; callers reuse its result for all its fares.
 
         observed_at is required and must be timezone-aware. Ordering uses its
         UTC value, then database-local run_id, independently of observation writes.
@@ -166,11 +179,29 @@ class SQLiteFareHistory:
         if run.watch_id != watch.watch_id:
             raise ValueError("Run must match the watch")
         row = connection.execute(
-            "SELECT * FROM monitoring_runs WHERE run_id = ?", (run.run_id,)
+            "SELECT run_id, watch_id, observed_at FROM monitoring_runs "
+            "WHERE run_id = ?",
+            (run.run_id,),
         ).fetchone()
         if row is None or MonitoringRun.model_validate(dict(row)) != run:
             raise ValueError("Run must match a persisted run in this repository")
         return run
+
+    def mark_run_completed(self, watch: FareWatch, *, run: MonitoringRun) -> None:
+        """Make a normally finished check eligible for future prior-run history.
+
+        Repeating completion is harmless. Unknown runs or mismatched metadata
+        raise ValueError, as with observation writes and prior-history queries.
+        Completion is repository state, not part of immutable run identity.
+        """
+        watch = FareWatch.model_validate(watch.model_dump())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = self._validate_run(connection, watch, run)
+            connection.execute(
+                "UPDATE monitoring_runs SET completed = 1 WHERE run_id = ?",
+                (run.run_id,),
+            )
 
     def record_observation(
         self,
@@ -321,9 +352,9 @@ class SQLiteFareHistory:
         before_run: MonitoringRun,
         itinerary_id: str | None = None,
     ) -> list[FareObservation]:
-        """Known-run history strictly before (run timestamp, run ID).
+        """Completed-run history strictly before (run timestamp, run ID).
 
-        Excludes the entire current run, later runs, and all null-run records.
+        Excludes incomplete runs, the current run, later runs, and null-run records.
         Returns oldest runs first, then observation ID within a run. Omitting
         itinerary_id includes every itinerary in the watch, even if none recur.
         Records within a run are alternatives, not temporal price changes.
@@ -335,7 +366,8 @@ class SQLiteFareHistory:
             query = """SELECT o.* FROM fare_observations AS o
                        JOIN monitoring_runs AS r ON o.run_id = r.run_id
                            AND o.watch_id = r.watch_id
-                       WHERE r.watch_id = ? AND (r.observed_at, r.run_id) < (?, ?)"""
+                       WHERE r.completed = 1 AND r.watch_id = ?
+                           AND (r.observed_at, r.run_id) < (?, ?)"""
             parameters: list[str | int] = [
                 watch.watch_id,
                 run.observed_at.isoformat(timespec="microseconds"),

@@ -73,7 +73,7 @@ def test_initialization_is_idempotent(tmp_path: Path) -> None:
     SQLiteFareHistory(path)
     SQLiteFareHistory(path)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert {
             row[0]
             for row in connection.execute(
@@ -83,7 +83,7 @@ def test_initialization_is_idempotent(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-@pytest.mark.parametrize("version", [3, 99])
+@pytest.mark.parametrize("version", [4, 99])
 def test_unknown_schema_is_not_overwritten(tmp_path: Path, version: int) -> None:
     path = tmp_path / "future.sqlite3"
     with closing(sqlite3.connect(path)) as connection:
@@ -467,6 +467,7 @@ def test_create_runs_normalizes_time_and_persists(
     observation = reopened.record_observation(watch, fare(), run=first)
     assert observation.run_id == first.run_id
     assert observation.observed_at == START
+    reopened.mark_run_completed(watch, run=first)
     assert reopened.get_prior_observations(watch, before_run=second) == [observation]
 
 
@@ -481,6 +482,8 @@ def test_runs_order_by_timestamp_then_id_independently_of_observation_writes(
     tied_fare = repository.record_observation(watch, fare("700"), run=tied)
     first_fare = repository.record_observation(watch, fare("800"), run=first)
     earliest_fare = repository.record_observation(watch, fare("900"), run=earliest)
+    for run in (future, first, tied, earliest):
+        repository.mark_run_completed(watch, run=run)
     assert repository.get_prior_observations(watch, before_run=earliest) == []
     assert repository.get_prior_observations(watch, before_run=tied) == [
         earliest_fare,
@@ -506,6 +509,8 @@ def test_prior_history_supports_both_scopes_and_excludes_entire_current_run(
     repository.record_observation(watch, fare("1"), run=current)
     repository.record_observation(watch, alternative_fare("2"), run=current)
     repository.record_observation(watch, fare("0"), observed_at=START)
+    for run in (first, second, current):
+        repository.mark_run_completed(watch, run=run)
     assert a.run_id == b.run_id != c.run_id
     assert a.itinerary_id == c.itinerary_id != b.itinerary_id
     assert repository.get_prior_observations(watch, before_run=current) == [a, b, c]
@@ -536,6 +541,7 @@ def test_watch_history_does_not_require_recurring_itineraries(
     current = repository.create_run(watch, observed_at=START)
     previous_fare = repository.record_observation(watch, fare(), run=prior)
     new_fare = repository.record_observation(watch, alternative_fare(), run=current)
+    repository.mark_run_completed(watch, run=prior)
     assert repository.get_prior_observations(watch, before_run=current) == [
         previous_fare
     ]
@@ -615,6 +621,8 @@ def test_watch_run_mismatch_rejected_for_writes_and_queries(
         repository.get_prior_observations(other, before_run=run)
     with pytest.raises(ValueError, match="match the watch"):
         repository.get_prior_run_statistics(other, before_run=run)
+    with pytest.raises(ValueError, match="match the watch"):
+        repository.mark_run_completed(other, run=run)
     with closing(sqlite3.connect(repository.database_path)) as connection:
         assert connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0] == 1
 
@@ -630,6 +638,8 @@ def test_unpersisted_or_altered_run_rejected(
         repository.record_observation(watch, fare(), run=run)
     with pytest.raises(ValueError, match="persisted run"):
         repository.get_prior_observations(watch, before_run=run)
+    with pytest.raises(ValueError, match="persisted run"):
+        repository.mark_run_completed(watch, run=run)
 
 
 def test_naive_run_and_inconsistent_observation_timestamp_rejected(
@@ -699,6 +709,7 @@ def test_prior_run_decimal_statistics_preserve_precision_and_currency(
     prices = ["12345678901234567890.123456789", "12345678901234567890.123456791"]
     for run, price in zip((first, second), prices):
         repository.record_observation(watch, fare(price, currency), run=run)
+        repository.mark_run_completed(watch, run=run)
     with localcontext() as context:
         context.prec = 3
         context.rounding = ROUND_UP
@@ -779,7 +790,7 @@ def test_version_one_migrates_without_inventing_runs(
     repository = SQLiteFareHistory(version_one_database)
     SQLiteFareHistory(version_one_database)
     with closing(sqlite3.connect(version_one_database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("SELECT * FROM monitoring_runs").fetchall() == []
         rows = connection.execute("SELECT * FROM fare_observations").fetchall()
@@ -795,6 +806,7 @@ def test_version_one_migrates_without_inventing_runs(
         == 0
     )
     known = repository.record_observation(watch, fare("100"), run=prior)
+    repository.mark_run_completed(watch, run=prior)
     assert repository.get_prior_observations(watch, before_run=current) == [known]
     assert repository.get_prior_observations(
         watch, before_run=current, itinerary_id=known.itinerary_id
@@ -875,3 +887,145 @@ def test_concurrent_duplicate_writers_reuse_one_observation(
         results = [future.result() for future in futures]
     assert results[0] == results[1]
     assert repository.get_recent_observations(watch) == [results[0]]
+
+
+def test_completion_controls_both_prior_scopes_and_statistics(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    prior = repository.create_run(watch, observed_at=START)
+    current = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare("1000"), run=prior)
+    second = repository.record_observation(watch, alternative_fare("800"), run=prior)
+    repository.record_observation(watch, fare("1"), run=current)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        assert connection.execute(
+            "SELECT completed FROM monitoring_runs"
+        ).fetchall() == [(0,), (0,)]
+    for itinerary_id in (None, first.itinerary_id):
+        assert (
+            repository.get_prior_observations(
+                watch, before_run=current, itinerary_id=itinerary_id
+            )
+            == []
+        )
+        assert (
+            repository.get_prior_run_statistics(
+                watch, before_run=current, itinerary_id=itinerary_id
+            ).observation_count
+            == 0
+        )
+
+    repository.mark_run_completed(watch, run=prior)
+    repository.mark_run_completed(watch, run=prior)  # Idempotent.
+    reopened = SQLiteFareHistory(repository.database_path)
+    assert reopened.get_prior_observations(watch, before_run=current) == [first, second]
+    assert reopened.get_prior_observations(
+        watch, before_run=current, itinerary_id=first.itinerary_id
+    ) == [first]
+    stats = reopened.get_prior_run_statistics(watch, before_run=current)
+    assert stats.observation_count == 2
+    assert stats.run_count == 1
+    assert stats.minimum_price == Decimal("800")
+    assert stats.maximum_price == Decimal("1000")
+    assert stats.average_price == Decimal("900")
+    scoped = reopened.get_prior_run_statistics(
+        watch, before_run=current, itinerary_id=first.itinerary_id
+    )
+    assert scoped.observation_count == scoped.run_count == 1
+    assert (
+        scoped.minimum_price
+        == scoped.maximum_price
+        == scoped.average_price
+        == Decimal("1000")
+    )
+    assert len(reopened.get_recent_observations(watch)) == 3
+    assert reopened.get_lowest_price(watch) == Decimal("1")
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        assert connection.execute(
+            "SELECT completed FROM monitoring_runs ORDER BY run_id"
+        ).fetchall() == [(1,), (0,)]
+
+
+@pytest.fixture
+def version_two_database(version_one_database: Path) -> Path:
+    # Use the unchanged v1->v2 builder; the v3 migration under test is not involved.
+    with closing(sqlite3.connect(version_one_database)) as connection, connection:
+        SQLiteFareHistory._migrate_v1_to_v2(connection)
+        watch_id = connection.execute("SELECT watch_id FROM watches").fetchone()[0]
+        for run_id in (1, 2):
+            connection.execute(
+                "INSERT INTO monitoring_runs VALUES (?, ?, ?)",
+                (run_id, watch_id, START.isoformat(timespec="microseconds")),
+            )
+            connection.execute(
+                "UPDATE fare_observations SET run_id = ? WHERE observation_id = ?",
+                (run_id, run_id),
+            )
+    return version_one_database
+
+
+def test_v2_migration_preserves_history_and_defaults_new_runs_to_incomplete(
+    version_two_database: Path, watch: FareWatch
+) -> None:
+    with closing(sqlite3.connect(version_two_database)) as connection:
+        original = connection.execute("SELECT * FROM fare_observations").fetchall()
+    repository = SQLiteFareHistory(version_two_database)
+    SQLiteFareHistory(version_two_database)
+    with closing(sqlite3.connect(version_two_database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert (
+            connection.execute("SELECT * FROM fare_observations").fetchall() == original
+        )
+        assert connection.execute(
+            "SELECT completed FROM monitoring_runs"
+        ).fetchall() == [(1,), (1,)]
+    incomplete = repository.create_run(watch, observed_at=START)
+    repository.record_observation(watch, fare("0.01"), run=incomplete)
+    current = repository.create_run(watch, observed_at=START)
+    prior = repository.get_prior_observations(watch, before_run=current)
+    assert [item.run_id for item in prior] == [1, 2]
+    assert [item.total_price for item in prior] == [Decimal("0.1000"), Decimal("0.20")]
+    repository.mark_run_completed(watch, run=incomplete)
+    assert [
+        item.run_id
+        for item in repository.get_prior_observations(watch, before_run=current)
+    ] == [1, 2, incomplete.run_id]
+
+
+def test_v3_migration_failure_rolls_back_marker_and_version(
+    version_two_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with closing(sqlite3.connect(version_two_database)) as connection:
+        before = list(connection.iterdump())
+    migrate = SQLiteFareHistory._migrate_v2_to_v3
+
+    def failing_migration(connection: sqlite3.Connection) -> None:
+        migrate(connection)
+        raise RuntimeError("migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteFareHistory, "_migrate_v2_to_v3", staticmethod(failing_migration)
+        )
+        with pytest.raises(RuntimeError, match="migration failure"):
+            SQLiteFareHistory(version_two_database)
+    with closing(sqlite3.connect(version_two_database)) as connection:
+        assert list(connection.iterdump()) == before
+    SQLiteFareHistory(version_two_database)
+
+
+@pytest.mark.parametrize("completed", [None, -1, 2])
+def test_database_rejects_invalid_completion_marker(
+    repository: SQLiteFareHistory, watch: FareWatch, completed: int | None
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError), connection:
+            connection.execute(
+                "UPDATE monitoring_runs SET completed = ? WHERE run_id = ?",
+                (completed, run.run_id),
+            )
+        assert connection.execute(
+            "SELECT completed FROM monitoring_runs"
+        ).fetchone() == (0,)

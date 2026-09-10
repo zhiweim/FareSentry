@@ -8,7 +8,9 @@ recommendation adapter now chooses among acceptable round trips using explicit
 soft preferences and deterministic facts. A local SQLite repository stores fare
 observations and computes deterministic history statistics. A pure alert evaluator
 uses prior-run history and explicit policy to decide which opportunities to
-surface. Frontend, notifications, and AWS infrastructure are not implemented.
+surface. `run_monitoring_cycle()` connects these components for one complete
+watch check with bounded return lookups. Frontend, notifications, and AWS
+infrastructure are not implemented.
 
 ## Local setup (Windows PowerShell)
 
@@ -414,7 +416,7 @@ The `watches` table stores the watch ID, validated context JSON, and currency.
 `fare_observations` stores an insertion ID, watch ID, UTC observation timestamp,
 Decimal price text, currency, itinerary ID, typed outbound/inbound JSON, and an
 optional run ID. `monitoring_runs` stores a database-local integer run ID, watch
-ID, and explicit UTC timestamp.
+ID, explicit UTC timestamp, and a checked `completed` flag.
 These normalized directions retain flight numbers, airlines, airports, flight
 durations, and connections; stops and total durations are derived from them.
 No provider tokens, raw SerpApi dictionaries, credentials, or LLM responses are
@@ -430,6 +432,11 @@ backdated runs sort by their explicit timestamp, regardless of when their fares
 are inserted. Run objects must match persisted metadata in the repository and
 belong to the observation's watch. Run-bound observations use the run timestamp;
 an explicitly supplied observation timestamp must represent that same instant.
+New runs begin incomplete. After preparing a normal outcome, call
+`history.mark_run_completed(watch, run=run)` to make the run's observations
+eligible for future alert history. Repeating completion is harmless; unknown runs
+or mismatched run metadata raise `ValueError`. The one-cycle runner handles this
+automatically. Completion is persisted state, separate from immutable run identity.
 
 There is one canonical observation per `(run_id, itinerary_id)`. Repeating the
 same normalized itinerary and numerically equal Decimal fare returns the original
@@ -445,14 +452,14 @@ ungrouped observations, defaulting the timestamp to now in UTC. These have null
 run membership and cannot be used as run-aware alert history. No run boundaries
 are inferred from timestamps, insertion IDs, itinerary IDs, or prices.
 
-`get_prior_observations(watch, before_run=run)` includes only known runs strictly
+`get_prior_observations(watch, before_run=run)` includes only completed runs strictly
 preceding the supplied run. It excludes every observation in the current run,
-later runs, and all null-run records. Results order by run timestamp, run ID,
-then observation ID within each run. Use `itinerary_id` for same-itinerary history;
+later runs, incomplete/failed runs, and all null-run records. Results order by run
+timestamp, run ID, then observation ID within each run. Use `itinerary_id` for same-itinerary history;
 omit it for whole-watch history across different itineraries. The itinerary does
 not need to recur in another run. Within-run records are alternatives, not
-temporal fare changes. Each query reads one database snapshot; runs are not
-finalized batches, so later writes to an earlier run can change future queries.
+temporal fare changes. Each query reads one database snapshot. Application callers
+should finish writing a run's observations before marking it completed.
 
 `get_prior_run_statistics()` accepts the same scope and returns
 `PriorRunPriceStatistics`: the boundary run, currency, itinerary filter, observation
@@ -464,8 +471,9 @@ prices. This API does not compare the current fare or make alert decisions.
 
 The original `get_recent_observations()`, `get_lowest_price()`, and
 `get_price_statistics()` retain their record-based semantics, including ungrouped
-history. Recent reads sort by observation timestamp then insertion ID; `limit`
-selects the latest N observations and returns them oldest first. These APIs do
+history and observations from incomplete runs. Recent reads sort by observation
+timestamp then insertion ID; `limit` selects the latest N observations and returns
+them oldest first. These APIs do
 not establish temporal run boundaries.
 
 Statistics expose count, minimum, maximum, average, current price, previous price,
@@ -485,10 +493,13 @@ precision. Results do not depend on the caller's Decimal precision or rounding.
 Queries currently load their scoped history into memory, appropriate for the
 initial local store.
 
-Schema version 2 is tracked with `PRAGMA user_version`. Version 1 is migrated
+Schema version 3 is tracked with `PRAGMA user_version`. Version 1 is migrated
 transactionally by adding the run table, nullable observation membership, indexes,
-and watch/run consistency triggers. All existing observations remain unchanged
-with null run membership; no legacy runs are invented. Initialization/migration
+and watch/run consistency triggers, followed by the version-3 completion marker.
+Version 2 migrates by adding `completed INTEGER NOT NULL DEFAULT 0` constrained to
+0 or 1. All preexisting v2 runs are marked completed to preserve existing history;
+new runs default to incomplete. Observations are unchanged, and v1 observations
+retain null run membership; no legacy runs are invented. Initialization/migration
 is repeatable, and a failure rolls back both schema changes and the version.
 Foreign keys enforce watch/currency and run existence. An empty version-0 database
 is initialized, while nonempty unversioned databases and unsupported versions are
@@ -529,6 +540,8 @@ decision = evaluate_alert(
     ),
 )
 print(decision.model_dump_json(indent=2))
+# After all normal outcome preparation succeeds:
+history.mark_run_completed(watch, run=run)
 ```
 
 The candidate ID must equal `Recommendation.selected_candidate_id`. The itinerary
@@ -538,11 +551,16 @@ constraints are checked defensively using the existing deterministic evaluator.
 Recommendation prose and confidence do not affect alert rules. Invalid identity,
 currency, constraint, or run inputs raise errors rather than produce an alert.
 
-Supply complete, unfiltered whole-watch history from the same repository. Do not
-use an itinerary filter or a recent-record limit: those omit facts needed for
-watch-level references and first-observation detection. The evaluator also accepts
-unfiltered repository history and excludes null-run membership and all runs at or
-after the current run. Run-bound observation timestamps equal their run timestamp
+Supply whole-watch history from the same repository. Do not use an itinerary
+filter or a recent-record limit: those omit facts needed for watch-level
+references and first-observation detection. The one-cycle application API below
+filters this history against active hard constraints to define eligible fare
+opportunities; the pure evaluator does not filter historical constraints itself.
+The evaluator additionally excludes null-run membership and all runs at or
+after the current run. Completion is database state unavailable in a
+`FareObservation`, so callers must use the completion-filtered prior-history API;
+do not substitute raw `get_recent_observations()` results for alert references.
+Run-bound observation timestamps equal their run timestamp
 under the repository contract, so comparisons use `(observed_at, run_id)` and
 never observation insertion order. Contradictory run timestamps and duplicate
 prior `(run_id, itinerary_id)` records are rejected. As a pure function, it cannot
@@ -597,3 +615,93 @@ Decimal values as strings. Use `model_dump_json(round_trip=True)` to save source
 state that can be reloaded with `AlertDecision.model_validate_json()`; derived
 fields are then recomputed. Alert numeric inputs reject floats, booleans, and
 nonfinite values. No scheduling or notification delivery is implemented.
+
+## One monitoring cycle
+
+`faresentry.monitoring.run_monitoring_cycle()` is the synchronous application
+entry point. Inject a `FlightProvider`, a `FareHistoryRepository` (implemented by
+`SQLiteFareHistory`), and a `Recommender` (implemented by `StrandsRecommender`).
+The orchestration module imports neither the SerpApi implementation nor the
+Strands SDK. Using the configured `provider`, `query`, `constraints`, `preferences`,
+`history`, and `model` from the examples above:
+
+```python
+from faresentry.monitoring import run_monitoring_cycle
+
+result = run_monitoring_cycle(
+    query,
+    constraints=constraints,
+    preferences=preferences,
+    policy=AlertPolicy(
+        currency=query.currency,
+        minimum_absolute_improvement="100",
+        first_observation="suppress",
+    ),
+    provider=provider,
+    history=history,
+    recommender=StrandsRecommender(model=model),
+    max_return_lookups=3,
+)
+print(result.model_dump_json(indent=2))
+```
+
+Each call creates exactly one persisted monitoring run and performs one initial
+search. Choices with missing/blank departure tokens or failing outbound hard
+constraints are skipped. The first `max_return_lookups` remaining choices, in
+provider order, receive return lookups. The default is 3; the limit must be a
+positive integer. Quoted outbound-choice prices do not reorder provider results.
+All completed returns from those lookups are considered, so the limit bounds
+return-lookup calls, not the number of candidates or provider-internal retries.
+
+Completed itineraries are checked against both-direction hard constraints.
+Identical normalized itinerary identities and equal fares are deduplicated in
+first-seen order. Conflicting fares under one identity raise
+`ConflictingItineraryError` before any observations are written. The existing
+identity excludes price and lacks schedule times, cabin, baggage, and other
+fare-product details; the runner cannot distinguish those products or silently
+choose a representative fare. Stable `itinerary_identity()` hashes serve as
+candidate IDs in both recommendation and persistence.
+
+Only eligible unique completed fares are recorded, all under the current run,
+before the single recommendation call. Every eligible candidate is supplied to
+that call, and all returned structured references are checked against that set.
+The selected ID maps to `result.selected_itinerary`. No recommendation prose is
+parsed and no new agent behavior is added.
+
+After recommendation, `get_prior_observations(watch, before_run=run)` retrieves
+the completed prior watch scope in one snapshot. It excludes the current run,
+later runs, incomplete/failed runs, and legacy null-run observations. Since watch
+identity excludes hard constraints, the runner rechecks prior fares against the active constraints,
+also protecting against ineligible records written by other callers. The existing
+alert evaluator derives same-itinerary previous price, watch low, and watch
+average from that eligible prior scope. Relaxing constraints cannot recover
+fares that previous cycles never recorded; history represents observed eligible
+opportunities, not an exhaustive market history. Raw repository statistics retain
+their existing semantics.
+
+`MonitoringRunResult` includes watch/run IDs, status, outbound and lookup counts,
+unique completed/rejected/eligible counts, duplicate count, and optional selected
+itinerary, `Recommendation`, and `AlertDecision`. Outbound prescreen rejections
+are counted separately. Status `completed` means an alert decision was evaluated;
+inspect `result.alert_decision.should_alert` for its answer. Normal empty outcomes
+are `no_outbound_options`, `no_usable_departure_tokens`,
+`no_eligible_outbound_options`, `no_completed_itineraries`, and
+`no_eligible_candidates`. They retain the run and counts but have no recommendation
+or alert decision.
+
+Provider, persistence, and recommendation failures propagate; no retries or
+fallback selections turn failures into empty results. The cycle is not one
+database transaction across external calls: an already-created run and any
+committed eligible observations remain if a later step fails. A new invocation
+creates a new run. A run is marked completed only after its structured result has
+been prepared, including every normal empty outcome and `should_alert=False`.
+Saving completion is the last persistence operation before returning; failure to
+save the marker propagates. Provider, observation-write, recommendation/validation,
+history-read, alert-evaluation, or result-preparation failures leave the run
+incomplete. Retained observations from these runs remain available through raw
+history APIs but are excluded from future alert baselines, including previous
+same-itinerary price, watch low, and watch average. No long-lived transaction spans
+provider or model work. No raw responses, tokens, or credentials enter history.
+For deterministic tests, inject `clock=lambda: aware_datetime`; it is called once
+per valid check. Tests use scripted dependencies and temporary SQLite files,
+with real HTTP and AWS calls blocked. This API performs no scheduling or delivery.

@@ -363,8 +363,10 @@ def evaluate_alert(
 ) -> AlertDecision:
     """Evaluate a recommended, already-approved candidate without I/O or mutation.
 
-    Supply complete whole-watch history from the repository (prefer its
-    get_prior_observations API without an itinerary filter or a record limit).
+    Supply completed-run whole-watch history from the repository's
+    get_prior_observations API without an itinerary filter or a record limit.
+    Completion is database state absent from FareObservation; this pure function
+    cannot check it, so raw recent observations are not a safe substitute.
     Run-bound observation timestamps are run timestamps by the persistence
     contract. We defensively filter by (that timestamp, run_id), never row ID,
     and always exclude the current run and null membership. The caller supplies

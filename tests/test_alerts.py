@@ -376,6 +376,8 @@ def test_repository_history_excludes_current_later_and_legacy_rows(
     repository.record_observation(watch, fare("1", alternative=True), run=current)
     repository.record_observation(watch, fare("2"), run=later)
     repository.record_observation(watch, fare("0"), observed_at=START)
+    for run in (prior, current, later):
+        repository.mark_run_completed(watch, run=run)
     data = inputs(watch)
     data.update(
         current_run=current,
