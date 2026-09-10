@@ -5,8 +5,9 @@ MVP-001 retrieves real outbound flight choices from SerpApi Google Flights and
 normalizes them into domain models. A selected outbound choice can now retrieve
 compatible return options as completed round-trip itineraries. A Strands
 recommendation adapter now chooses among acceptable round trips using explicit
-soft preferences and deterministic facts. Persistence, frontend, notifications,
-and AWS infrastructure are not implemented.
+soft preferences and deterministic facts. A local SQLite repository stores fare
+observations and computes deterministic history statistics. Frontend,
+notifications, and AWS infrastructure are not implemented.
 
 ## Local setup (Windows PowerShell)
 
@@ -103,6 +104,9 @@ src/faresentry/
     models.py                 Trip queries, outbound choices, and typed itineraries
     constraints.py            Deterministic hard-constraint evaluation
     recommendations.py        Typed candidate summaries, comparisons, output validation
+    history.py                Watch identity, observations, and Decimal statistics
+    persistence/
+        sqlite.py             Versioned SQLite fare-history repository
     agents/
         recommendation.py     Injectable Strands recommendation adapter
     providers/
@@ -119,6 +123,7 @@ tests/
     test_return_options.py    Return lookup, complete itineraries, and pricing tests
     test_search_flights.py    Smoke-test CLI validation and output tests
     test_recommendations.py   Facts, preference validation, and offline agent tests
+    test_history.py           Temporary SQLite databases and deterministic history tests
 ```
 
 `TripQuery` accepts one origin, destination, outbound date, return date, and
@@ -355,4 +360,91 @@ price_judgments = [
 Invalid input raises `ValueError`; malformed output or an unknown structured
 ID raises `InvalidRecommendationError`; other SDK/provider failures raise
 `RecommendationError`. Both recommendation errors have safe display messages.
-There is no fallback selection on failure and no price history or alert decision.
+There is no fallback selection on failure or alert decision. History is available
+through the separate repository below; the recommendation adapter does not write it.
+
+## SQLite fare history
+
+`SQLiteFareHistory` uses Python's standard-library `sqlite3`; no new dependency or
+credentials are needed. Supply a dedicated database file with an existing parent
+directory. Construction creates the file/schema when absent. Each operation closes
+its connection, so repositories can be reopened without a lifecycle/close method.
+`:memory:` is intentionally unsupported; tests use pytest `tmp_path` files.
+
+Given the original `query: TripQuery` and a completed `selected_trip:
+RoundTripItinerary` from the examples above:
+
+```python
+from datetime import UTC, datetime
+from pathlib import Path
+
+from faresentry.history import FareWatch
+from faresentry.persistence import SQLiteFareHistory
+
+history = SQLiteFareHistory(Path("fares.sqlite3"))
+watch = FareWatch.from_query(query)
+observation = history.record_observation(
+    watch, selected_trip, observed_at=datetime.now(UTC)
+)
+recent = history.get_recent_observations(watch, limit=20)
+lowest = history.get_lowest_price(watch)
+statistics = history.get_price_statistics(watch)
+same_itinerary = history.get_price_statistics(
+    watch, itinerary_id=observation.itinerary_id
+)
+```
+
+The immutable watch uses a versioned SHA-256 hash of canonical origin,
+destination, outbound date, return date, and currency. Identical queries share
+history; preferences and hard-constraint policies are not part of this raw fare
+history. The caller decides which complete fares to record. If cabin, passenger
+counts, or additional search filters become configurable, extend the watch and
+version its identity before using them. Currency must match the watch, as must
+the itinerary's route. Dates come from the original query because normalized
+itineraries currently lack dates.
+
+The `watches` table stores the watch ID, validated context JSON, and currency.
+`fare_observations` stores an insertion ID, watch ID, UTC observation timestamp,
+Decimal price text, currency, itinerary ID, and typed outbound/inbound JSON.
+These normalized directions retain flight numbers, airlines, airports, flight
+durations, and connections; stops and total durations are derived from them.
+No provider tokens, raw SerpApi dictionaries, credentials, or LLM responses are
+accepted or stored. The itinerary hash includes the watch and both normalized
+directions, excluding price. It remains stable across price changes, but changes
+when durations/connections change. Without schedule timestamps in the current
+domain model, it cannot uniquely identify every scheduled flight.
+
+Explicit timestamps must be timezone-aware and are normalized to UTC with fixed
+microsecond precision; omission uses current UTC time. Reads sort by timestamp,
+then insertion ID for ties. `limit` selects the latest N observations and returns
+them in chronological order; omit it for all records. Repeated calls append
+observations, including identical prices/timestamps. Statistics count records,
+not distinct polling runs. With no itinerary filter, observations of different
+candidates in the same watch contribute equally; use `itinerary_id` for comparisons
+of the same normalized itinerary over time.
+
+Statistics expose count, minimum, maximum, average, current price, previous price,
+historical low, and signed current-minus-reference differences. Current is the
+latest observation by timestamp/insertion ID, previous is its predecessor, and
+historical low is the minimum **before current**. Minimum/maximum/average include
+current. A new record low therefore produces a negative
+`current_vs_historical_low`. Missing comparisons are `None`; empty history has
+count zero, no prices, and `get_lowest_price()` returns `None`.
+
+Prices use SQLite `TEXT` and round-trip through `Decimal` without conversion to
+float or forced currency rounding. Numeric comparisons and aggregation run in
+Python, never SQLite `AVG`/`SUM` or lexical `MIN` on text. Calculations use a local
+Decimal context with at least 28 significant digits, increased as necessary to
+preserve exact sums/differences. Repeating averages round half-even at that
+precision. Results do not depend on the caller's Decimal precision or rounding.
+Queries currently load their scoped history into memory, appropriate for the
+initial local store.
+
+Schema version 1 is tracked with `PRAGMA user_version`. Initialization and each
+record operation are transactional; foreign keys enforce watch/currency matching,
+and indexes support watch/itinerary time ordering. An empty version-0 database is
+initialized, while nonempty unversioned databases and unsupported versions are
+rejected without modification. Future migrations must explicitly transform data
+in a transaction and then update the version. The existing `.gitignore` excludes
+`*.db` and `*.sqlite3`. No automatic recording, alert decisions, scheduling, or
+provider/agent behavior is added.
