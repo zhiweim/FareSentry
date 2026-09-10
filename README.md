@@ -6,8 +6,9 @@ normalizes them into domain models. A selected outbound choice can now retrieve
 compatible return options as completed round-trip itineraries. A Strands
 recommendation adapter now chooses among acceptable round trips using explicit
 soft preferences and deterministic facts. A local SQLite repository stores fare
-observations and computes deterministic history statistics. Frontend,
-notifications, and AWS infrastructure are not implemented.
+observations and computes deterministic history statistics. A pure alert evaluator
+uses prior-run history and explicit policy to decide which opportunities to
+surface. Frontend, notifications, and AWS infrastructure are not implemented.
 
 ## Local setup (Windows PowerShell)
 
@@ -105,6 +106,7 @@ src/faresentry/
     constraints.py            Deterministic hard-constraint evaluation
     recommendations.py        Typed candidate summaries, comparisons, output validation
     history.py                Watch identity, observations, and Decimal statistics
+    alerts.py                 Pure alert policy, signals, and opportunity decisions
     persistence/
         sqlite.py             Versioned SQLite fare-history repository
     agents/
@@ -124,6 +126,7 @@ tests/
     test_search_flights.py    Smoke-test CLI validation and output tests
     test_recommendations.py   Facts, preference validation, and offline agent tests
     test_history.py           Temporary SQLite databases and deterministic history tests
+    test_alerts.py            Alert policy, run-aware references, and decision semantics
 ```
 
 `TripQuery` accepts one origin, destination, outbound date, return date, and
@@ -490,5 +493,107 @@ is repeatable, and a failure rolls back both schema changes and the version.
 Foreign keys enforce watch/currency and run existence. An empty version-0 database
 is initialized, while nonempty unversioned databases and unsupported versions are
 rejected without modification. The existing `.gitignore` excludes
-`*.db` and `*.sqlite3`. No automatic recording, alert decisions, scheduling, or
-provider/agent behavior is added.
+`*.db` and `*.sqlite3`. Persistence does not automatically record fares or make
+alert decisions; the explicit decision API below consumes its normalized data.
+
+## Deterministic opportunity decisions
+
+`faresentry.alerts.evaluate_alert()` consumes a structured `Recommendation`, the
+selected complete itinerary and current `FareObservation`, a `MonitoringRun`,
+whole-watch history, active hard constraints, and an explicit `AlertPolicy`.
+It performs no I/O and calls no provider, agent, or notification service.
+
+Using the recommendation and history objects from the preceding examples:
+
+```python
+from decimal import Decimal
+
+from faresentry.alerts import AlertPolicy, evaluate_alert
+
+decision = evaluate_alert(
+    watch=watch,
+    current_run=run,
+    candidate_id=recommendation.selected_candidate_id,
+    itinerary=selected_trip,
+    current_observation=observation,
+    history=history.get_prior_observations(watch, before_run=run),
+    recommendation=recommendation,
+    constraints=constraints,
+    policy=AlertPolicy(
+        currency=watch.currency,
+        minimum_absolute_improvement=Decimal("50"),
+        minimum_percentage_improvement=Decimal("5"),
+        target_price=Decimal("1000"),
+        historical_low_mode="sufficient",
+        first_observation="suppress",
+    ),
+)
+print(decision.model_dump_json(indent=2))
+```
+
+The candidate ID must equal `Recommendation.selected_candidate_id`. The itinerary
+must match the current observation's normalized directions, fare, and currency;
+that observation must belong to the supplied watch and current run. Current hard
+constraints are checked defensively using the existing deterministic evaluator.
+Recommendation prose and confidence do not affect alert rules. Invalid identity,
+currency, constraint, or run inputs raise errors rather than produce an alert.
+
+Supply complete, unfiltered whole-watch history from the same repository. Do not
+use an itinerary filter or a recent-record limit: those omit facts needed for
+watch-level references and first-observation detection. The evaluator also accepts
+unfiltered repository history and excludes null-run membership and all runs at or
+after the current run. Run-bound observation timestamps equal their run timestamp
+under the repository contract, so comparisons use `(observed_at, run_id)` and
+never observation insertion order. Contradictory run timestamps and duplicate
+prior `(run_id, itinerary_id)` records are rejected. As a pure function, it cannot
+authenticate persisted provenance or detect history that the caller omitted.
+
+The reference semantics are explicit:
+
+- `previous_same_itinerary_price` is the last price of that itinerary in eligible
+  prior runs. Another itinerary's price is never labeled its previous price.
+- `prior_watch_low` and `prior_watch_average` cover all eligible observations in
+  the watch. The average is observation-weighted and uses the existing Decimal
+  history rounding. These are observed fares, not a record of previously selected
+  recommendations or evidence of historical constraint approval.
+- Improvement uses the previous same-itinerary price when available. A new
+  itinerary instead uses the prior watch low. The decision exposes both
+  `improvement_reference_type` and `improvement_reference_price`.
+- Absolute improvement is reference minus current price, with no money rounding.
+  Percentage improvement is `(reference - current) * 100 / reference`, rounded to
+  two decimal places with `ROUND_HALF_UP`. Threshold comparison uses that rounded
+  percentage. A zero reference makes percentage improvement unavailable. Numeric
+  calculations use a fresh Decimal context, independent of caller settings.
+
+`should_alert` requires **every prerequisite and at least one trigger**:
+
+- When both improvement thresholds are configured, **both must pass** for the
+  improvement trigger. A single configured threshold must pass on its own; no
+  configured thresholds means no improvement trigger. Thresholds are positive,
+  with percentage thresholds at most 100. Equality meets a threshold.
+- A configured target is both an inclusive ceiling and an independent trigger:
+  `current_price <= target_price`. Missing the target blocks every trigger.
+- A strict new low means `current_price < prior_watch_low`; equality is not a new
+  low. Mode `ignore` makes this informational, `sufficient` makes it an independent
+  trigger, and `required` makes it a prerequisite that still needs another trigger.
+- With no eligible prior watch history, `first_observation="suppress"` blocks
+  alerting; `"alert"` permits it and supplies a trigger. Target and required-low
+  prerequisites still apply. A required historical low cannot be established with
+  empty history. Previous price, low, average, and improvements remain null.
+
+For example, a newly recommended $975 itinerary can meet a $1,000 target even if
+the prior watch low was $950. It needs no same-itinerary history. Without another
+trigger, unchanged fares and price increases do not alert. Target hits may alert
+again on a later run; this foundation has no delivery state or notification log.
+Repeated evaluation of identical data deliberately returns the identical decision.
+
+`AlertDecision` contains immutable source facts and policy. Arithmetic, seven
+typed `AlertSignal` records, and `should_alert` are computed fields, not independent
+caller inputs. Each signal includes its role (prerequisite, trigger, both,
+component, or information), satisfaction, actual/reference values, and a
+deterministic explanation. Optional disabled rules remain visible but cannot
+trigger. Ordinary JSON serialization includes all computed fields and serializes
+Decimal values as strings. Use `model_dump_json(round_trip=True)` to save source
+state that can be reloaded with `AlertDecision.model_validate_json()`; derived
+fields are then recomputed. Alert numeric inputs reject floats, booleans, and
+nonfinite values. No scheduling or notification delivery is implemented.
