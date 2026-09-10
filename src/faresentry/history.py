@@ -51,6 +51,25 @@ def itinerary_identity(watch: FareWatch, itinerary: RoundTripItinerary) -> str:
     )
 
 
+class MonitoringRun(BaseModel):
+    """One check of one watch, ordered by (UTC observed_at, run_id).
+
+    IDs are persisted, database-local integers; timestamps may be backdated.
+    Creating two runs at the same instant still creates two distinct checks.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: int = Field(gt=0, strict=True)
+    watch_id: str = Field(pattern=r"^watch-v1-[0-9a-f]{64}$")
+    observed_at: AwareDatetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+
 class FareObservation(RoundTripItinerary):
     """Stored complete fare with safe, normalized itinerary details.
 
@@ -59,6 +78,7 @@ class FareObservation(RoundTripItinerary):
     """
 
     observation_id: int = Field(gt=0, strict=True)
+    run_id: int | None = Field(default=None, gt=0, strict=True)
     watch_id: str = Field(pattern=r"^watch-v1-[0-9a-f]{64}$")
     itinerary_id: str = Field(pattern=r"^itinerary-v1-[0-9a-f]{64}$")
     observed_at: AwareDatetime
@@ -90,6 +110,26 @@ class PriceStatistics(BaseModel):
     historical_low_price: Decimal | None = None
     current_vs_previous: Decimal | None = None
     current_vs_historical_low: Decimal | None = None
+
+
+class PriorRunPriceStatistics(BaseModel):
+    """Aggregates strictly before a run, excluding unknown run membership.
+
+    Each canonical observation counts once; average is observation-weighted,
+    not run-weighted. run_count counts represented runs, not empty checks.
+    No candidate record is designated a previous-run price at watch scope.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    before_run: MonitoringRun
+    currency: CurrencyCode
+    itinerary_id: str | None
+    observation_count: int = Field(ge=0)
+    run_count: int = Field(ge=0)
+    minimum_price: Decimal | None
+    maximum_price: Decimal | None
+    average_price: Decimal | None
 
 
 def calculate_price_statistics(

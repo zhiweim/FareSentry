@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import ROUND_UP, Decimal, localcontext
@@ -72,17 +73,17 @@ def test_initialization_is_idempotent(tmp_path: Path) -> None:
     SQLiteFareHistory(path)
     SQLiteFareHistory(path)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
-        } == {"watches", "fare_observations"}
+        } == {"watches", "fare_observations", "monitoring_runs"}
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-@pytest.mark.parametrize("version", [2, 99])
+@pytest.mark.parametrize("version", [3, 99])
 def test_unknown_schema_is_not_overwritten(tmp_path: Path, version: int) -> None:
     path = tmp_path / "future.sqlite3"
     with closing(sqlite3.connect(path)) as connection:
@@ -442,3 +443,435 @@ def test_record_transaction_rolls_back_watch_on_insert_failure(
     with closing(sqlite3.connect(repository.database_path)) as connection:
         assert connection.execute("SELECT * FROM watches").fetchall() == []
     assert repository.get_recent_observations(watch) == []
+
+
+def alternative_fare(price: str = "800") -> RoundTripItinerary:
+    data = fare(price).model_dump()
+    data["inbound"]["segments"][0]["flight_number"] = "EA 4"
+    return RoundTripItinerary.model_validate(data)
+
+
+def test_create_runs_normalizes_time_and_persists(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    local = START.astimezone(timezone(timedelta(hours=-7)))
+    first = repository.create_run(watch, observed_at=local)
+    second = repository.create_run(watch, observed_at=START)
+    assert first.run_id < second.run_id
+    assert first.watch_id == second.watch_id == watch.watch_id
+    assert first.observed_at == second.observed_at == START
+    assert first.observed_at.tzinfo is UTC
+    with pytest.raises(ValidationError, match="frozen"):
+        first.run_id = 99
+    reopened = SQLiteFareHistory(repository.database_path)
+    observation = reopened.record_observation(watch, fare(), run=first)
+    assert observation.run_id == first.run_id
+    assert observation.observed_at == START
+    assert reopened.get_prior_observations(watch, before_run=second) == [observation]
+
+
+def test_runs_order_by_timestamp_then_id_independently_of_observation_writes(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    future = repository.create_run(watch, observed_at=START + timedelta(days=1))
+    first = repository.create_run(watch, observed_at=START)
+    tied = repository.create_run(watch, observed_at=START)
+    earliest = repository.create_run(watch, observed_at=START - timedelta(days=1))
+    future_fare = repository.record_observation(watch, fare("500"), run=future)
+    tied_fare = repository.record_observation(watch, fare("700"), run=tied)
+    first_fare = repository.record_observation(watch, fare("800"), run=first)
+    earliest_fare = repository.record_observation(watch, fare("900"), run=earliest)
+    assert repository.get_prior_observations(watch, before_run=earliest) == []
+    assert repository.get_prior_observations(watch, before_run=tied) == [
+        earliest_fare,
+        first_fare,
+    ]
+    assert repository.get_prior_observations(watch, before_run=future) == [
+        earliest_fare,
+        first_fare,
+        tied_fare,
+    ]
+    assert future_fare not in repository.get_prior_observations(watch, before_run=first)
+
+
+def test_prior_history_supports_both_scopes_and_excludes_entire_current_run(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    first = repository.create_run(watch, observed_at=START)
+    second = repository.create_run(watch, observed_at=START + timedelta(days=1))
+    current = repository.create_run(watch, observed_at=START + timedelta(days=2))
+    a = repository.record_observation(watch, fare("1000"), run=first)
+    b = repository.record_observation(watch, alternative_fare("800"), run=first)
+    c = repository.record_observation(watch, fare("900"), run=second)
+    repository.record_observation(watch, fare("1"), run=current)
+    repository.record_observation(watch, alternative_fare("2"), run=current)
+    repository.record_observation(watch, fare("0"), observed_at=START)
+    assert a.run_id == b.run_id != c.run_id
+    assert a.itinerary_id == c.itinerary_id != b.itinerary_id
+    assert repository.get_prior_observations(watch, before_run=current) == [a, b, c]
+    assert repository.get_prior_observations(
+        watch, before_run=current, itinerary_id=a.itinerary_id
+    ) == [a, c]
+    stats = repository.get_prior_run_statistics(watch, before_run=current)
+    assert stats.before_run == current
+    assert stats.currency == "USD"
+    assert stats.itinerary_id is None
+    assert stats.observation_count == 3
+    assert stats.run_count == 2
+    assert stats.minimum_price == Decimal("800")
+    assert stats.maximum_price == Decimal("1000")
+    assert stats.average_price == Decimal("900")
+    scoped = repository.get_prior_run_statistics(
+        watch, before_run=current, itinerary_id=a.itinerary_id
+    )
+    assert scoped.observation_count == scoped.run_count == 2
+    assert scoped.average_price == Decimal("950")
+    assert "previous_price" not in stats.model_dump()
+
+
+def test_watch_history_does_not_require_recurring_itineraries(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    prior = repository.create_run(watch, observed_at=START)
+    current = repository.create_run(watch, observed_at=START)
+    previous_fare = repository.record_observation(watch, fare(), run=prior)
+    new_fare = repository.record_observation(watch, alternative_fare(), run=current)
+    assert repository.get_prior_observations(watch, before_run=current) == [
+        previous_fare
+    ]
+    assert (
+        repository.get_prior_observations(
+            watch, before_run=current, itinerary_id=new_fare.itinerary_id
+        )
+        == []
+    )
+    assert (
+        repository.get_prior_observations(
+            watch, before_run=current, itinerary_id="' OR 1=1 --"
+        )
+        == []
+    )
+
+
+def test_empty_prior_history_and_empty_runs(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    repository.create_run(watch, observed_at=START)
+    current = repository.create_run(watch, observed_at=START)
+    stats = repository.get_prior_run_statistics(watch, before_run=current)
+    assert stats.observation_count == stats.run_count == 0
+    assert stats.minimum_price is stats.maximum_price is stats.average_price is None
+
+
+@pytest.mark.parametrize("price", ["1000.00", "1000", "1E3"])
+def test_same_run_duplicate_reuses_original_record(
+    repository: SQLiteFareHistory, watch: FareWatch, price: str
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare(), run=run)
+    repeated = repository.record_observation(watch, fare(price), run=run)
+    assert repeated == first
+    assert repeated.total_price.as_tuple() == Decimal("1000.00").as_tuple()
+    assert repository.get_recent_observations(watch) == [first]
+
+
+def test_conflicting_duplicate_does_not_change_existing_fare(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare(), run=run)
+    with pytest.raises(ValueError, match="Conflicting"):
+        repository.record_observation(watch, fare("999"), run=run)
+    with pytest.raises(ValueError, match="currency"):
+        repository.record_observation(watch, fare(currency="EUR"), run=run)
+    assert repository.get_recent_observations(watch) == [first]
+
+
+def test_detail_conflict_under_same_identity_is_rejected(
+    repository: SQLiteFareHistory, watch: FareWatch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare(), run=run)
+    # Simulate an identity collision; normally changed details produce a new ID.
+    monkeypatch.setattr(
+        "faresentry.persistence.sqlite.itinerary_identity",
+        lambda watch, itinerary: first.itinerary_id,
+    )
+    with pytest.raises(ValueError, match="Conflicting"):
+        repository.record_observation(watch, alternative_fare("1000"), run=run)
+    assert repository.get_recent_observations(watch) == [first]
+
+
+def test_watch_run_mismatch_rejected_for_writes_and_queries(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    other = FareWatch.model_validate(
+        watch.model_dump() | {"outbound_date": "2026-12-02"}
+    )
+    run = repository.create_run(watch, observed_at=START)
+    with pytest.raises(ValueError, match="match the watch"):
+        repository.record_observation(other, fare(), run=run)
+    with pytest.raises(ValueError, match="match the watch"):
+        repository.get_prior_observations(other, before_run=run)
+    with pytest.raises(ValueError, match="match the watch"):
+        repository.get_prior_run_statistics(other, before_run=run)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM watches").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "change", [{"run_id": 999}, {"observed_at": START + timedelta(days=1)}]
+)
+def test_unpersisted_or_altered_run_rejected(
+    repository: SQLiteFareHistory, watch: FareWatch, change: dict[str, object]
+) -> None:
+    run = repository.create_run(watch, observed_at=START).model_copy(update=change)
+    with pytest.raises(ValueError, match="persisted run"):
+        repository.record_observation(watch, fare(), run=run)
+    with pytest.raises(ValueError, match="persisted run"):
+        repository.get_prior_observations(watch, before_run=run)
+
+
+def test_naive_run_and_inconsistent_observation_timestamp_rejected(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        repository.create_run(watch, observed_at=START.replace(tzinfo=None))
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        assert connection.execute("SELECT * FROM watches").fetchall() == []
+    run = repository.create_run(watch, observed_at=START)
+    with pytest.raises(ValueError, match="timestamp"):
+        repository.record_observation(
+            watch, fare(), run=run, observed_at=START + timedelta(seconds=1)
+        )
+    with pytest.raises(ValidationError, match="timezone"):
+        repository.record_observation(
+            watch, fare(), run=run, observed_at=START.replace(tzinfo=None)
+        )
+    local = START.astimezone(timezone(timedelta(hours=3)))
+    assert (
+        repository.record_observation(
+            watch, fare(), run=run, observed_at=local
+        ).observed_at
+        == START
+    )
+
+
+def test_run_creation_rolls_back_watch_on_failure(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_run BEFORE INSERT ON monitoring_runs
+               BEGIN SELECT RAISE(ABORT, 'run failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="run failure"):
+        repository.create_run(watch, observed_at=START)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        assert connection.execute("SELECT * FROM watches").fetchall() == []
+        assert connection.execute("SELECT * FROM monitoring_runs").fetchall() == []
+
+
+def test_run_observation_insert_failure_preserves_run_and_previous_records(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare(), run=run)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_fare BEFORE INSERT ON fare_observations
+               BEGIN SELECT RAISE(ABORT, 'fare failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="fare failure"):
+        repository.record_observation(watch, alternative_fare(), run=run)
+    assert repository.get_recent_observations(watch) == [first]
+    assert repository.get_prior_observations(watch, before_run=run) == []
+
+
+@pytest.mark.parametrize("currency", ["USD", "EUR", "JPY", "KWD"])
+def test_prior_run_decimal_statistics_preserve_precision_and_currency(
+    repository: SQLiteFareHistory, watch: FareWatch, currency: str
+) -> None:
+    watch = FareWatch.model_validate(watch.model_dump() | {"currency": currency})
+    first = repository.create_run(watch, observed_at=START)
+    second = repository.create_run(watch, observed_at=START)
+    current = repository.create_run(watch, observed_at=START)
+    prices = ["12345678901234567890.123456789", "12345678901234567890.123456791"]
+    for run, price in zip((first, second), prices):
+        repository.record_observation(watch, fare(price, currency), run=run)
+    with localcontext() as context:
+        context.prec = 3
+        context.rounding = ROUND_UP
+        stats = repository.get_prior_run_statistics(watch, before_run=current)
+    assert stats.currency == currency
+    assert stats.average_price == Decimal("12345678901234567890.123456790")
+    restored = repository.get_prior_observations(watch, before_run=current)
+    assert [item.total_price.as_tuple() for item in restored] == [
+        Decimal(p).as_tuple() for p in prices
+    ]
+    assert stats == repository.get_prior_run_statistics(watch, before_run=current)
+
+
+def test_run_inputs_unchanged(repository: SQLiteFareHistory, watch: FareWatch) -> None:
+    itinerary = fare()
+    run = repository.create_run(watch, observed_at=START)
+    before = [item.model_dump_json() for item in (watch, itinerary, run)]
+    repository.record_observation(watch, itinerary, run=run)
+    repository.get_prior_run_statistics(watch, before_run=run)
+    assert before == [item.model_dump_json() for item in (watch, itinerary, run)]
+
+
+@pytest.fixture
+def version_one_database(tmp_path: Path, watch: FareWatch) -> Path:
+    """Build the original schema directly, independently of migration code."""
+    path = tmp_path / "version-one.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """CREATE TABLE watches (
+                watch_id TEXT PRIMARY KEY, context_json TEXT NOT NULL,
+                currency TEXT NOT NULL, UNIQUE (watch_id, currency))"""
+        )
+        connection.execute(
+            """CREATE TABLE fare_observations (
+                observation_id INTEGER PRIMARY KEY, watch_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL, total_price TEXT NOT NULL,
+                currency TEXT NOT NULL, itinerary_id TEXT NOT NULL,
+                outbound_json TEXT NOT NULL, inbound_json TEXT NOT NULL,
+                FOREIGN KEY (watch_id, currency)
+                    REFERENCES watches (watch_id, currency))"""
+        )
+        connection.execute(
+            """CREATE INDEX observations_by_watch_time
+               ON fare_observations (watch_id, observed_at, observation_id)"""
+        )
+        connection.execute(
+            """CREATE INDEX observations_by_itinerary_time ON fare_observations
+               (watch_id, itinerary_id, observed_at, observation_id)"""
+        )
+        connection.execute(
+            "INSERT INTO watches VALUES (?, ?, ?)",
+            (watch.watch_id, watch.model_dump_json(), watch.currency),
+        )
+        for index, price in enumerate(("0.1000", "0.20"), start=1):
+            itinerary = fare(price)
+            connection.execute(
+                "INSERT INTO fare_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    index,
+                    watch.watch_id,
+                    START.isoformat(timespec="microseconds"),
+                    price,
+                    watch.currency,
+                    itinerary_identity(watch, itinerary),
+                    itinerary.outbound.model_dump_json(),
+                    itinerary.inbound.model_dump_json(),
+                ),
+            )
+        connection.execute("PRAGMA user_version = 1")
+    return path
+
+
+def test_version_one_migrates_without_inventing_runs(
+    version_one_database: Path, watch: FareWatch
+) -> None:
+    with closing(sqlite3.connect(version_one_database)) as connection:
+        original = connection.execute("SELECT * FROM fare_observations").fetchall()
+    repository = SQLiteFareHistory(version_one_database)
+    SQLiteFareHistory(version_one_database)
+    with closing(sqlite3.connect(version_one_database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT * FROM monitoring_runs").fetchall() == []
+        rows = connection.execute("SELECT * FROM fare_observations").fetchall()
+        assert rows == [(*row, None) for row in original]
+    old = repository.get_recent_observations(watch)
+    assert all(item.run_id is None for item in old)
+    assert old[0].total_price.as_tuple() == Decimal("0.1000").as_tuple()
+    assert repository.get_price_statistics(watch).observation_count == 2
+    prior = repository.create_run(watch, observed_at=START + timedelta(days=1))
+    current = repository.create_run(watch, observed_at=START + timedelta(days=2))
+    assert (
+        repository.get_prior_run_statistics(watch, before_run=current).observation_count
+        == 0
+    )
+    known = repository.record_observation(watch, fare("100"), run=prior)
+    assert repository.get_prior_observations(watch, before_run=current) == [known]
+    assert repository.get_prior_observations(
+        watch, before_run=current, itinerary_id=known.itinerary_id
+    ) == [known]
+    stats = repository.get_prior_run_statistics(watch, before_run=current)
+    assert (
+        stats.minimum_price
+        == stats.maximum_price
+        == stats.average_price
+        == Decimal("100")
+    )
+    assert stats.run_count == stats.observation_count == 1
+
+
+def test_migration_failure_rolls_back_schema_and_version(
+    version_one_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with closing(sqlite3.connect(version_one_database)) as connection:
+        before = list(connection.iterdump())
+    migrate = SQLiteFareHistory._migrate_v1_to_v2
+
+    def failing_migration(connection: sqlite3.Connection) -> None:
+        migrate(connection)
+        raise RuntimeError("migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteFareHistory, "_migrate_v1_to_v2", staticmethod(failing_migration)
+        )
+        with pytest.raises(RuntimeError, match="migration failure"):
+            SQLiteFareHistory(version_one_database)
+    with closing(sqlite3.connect(version_one_database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert list(connection.iterdump()) == before
+    SQLiteFareHistory(version_one_database)
+
+
+def test_database_enforces_run_membership_and_uniqueness(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    first = repository.record_observation(watch, fare(), run=run)
+    other = FareWatch.model_validate(
+        watch.model_dump() | {"outbound_date": "2026-12-02"}
+    )
+    other_run = repository.create_run(other, observed_at=START)
+    with closing(sqlite3.connect(repository.database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"), connection:
+            connection.execute(
+                """INSERT INTO fare_observations (
+                    watch_id, observed_at, total_price, currency, itinerary_id,
+                    outbound_json, inbound_json, run_id)
+                    SELECT watch_id, observed_at, total_price, currency, itinerary_id,
+                    outbound_json, inbound_json, run_id FROM fare_observations"""
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="match run"), connection:
+            connection.execute(
+                "UPDATE fare_observations SET run_id = ? WHERE observation_id = ?",
+                (other_run.run_id, first.observation_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"), connection:
+            connection.execute(
+                "DELETE FROM monitoring_runs WHERE run_id = ?", (run.run_id,)
+            )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_concurrent_duplicate_writers_reuse_one_observation(
+    repository: SQLiteFareHistory, watch: FareWatch
+) -> None:
+    run = repository.create_run(watch, observed_at=START)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(repository.record_observation, watch, fare(), run=run)
+            for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+    assert results[0] == results[1]
+    assert repository.get_recent_observations(watch) == [results[0]]

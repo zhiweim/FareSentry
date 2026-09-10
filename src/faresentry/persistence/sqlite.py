@@ -10,13 +10,15 @@ from pathlib import Path
 from faresentry.history import (
     FareObservation,
     FareWatch,
+    MonitoringRun,
     PriceStatistics,
+    PriorRunPriceStatistics,
     calculate_price_statistics,
     itinerary_identity,
 )
 from faresentry.models import FlightItinerary, RoundTripItinerary
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SQLiteFareHistory:
@@ -50,6 +52,9 @@ class SQLiteFareHistory:
             connection.execute("BEGIN IMMEDIATE")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == SCHEMA_VERSION:
+                return
+            if version == 1:
+                self._migrate_v1_to_v2(connection)
                 return
             if version != 0:
                 raise ValueError(f"Unsupported fare-history schema version: {version}")
@@ -88,6 +93,84 @@ class SQLiteFareHistory:
                    (watch_id, itinerary_id, observed_at, observation_id)"""
             )
             connection.execute("PRAGMA user_version = 1")
+            self._migrate_v1_to_v2(connection)
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Called inside the initialization transaction; never infer old runs."""
+        connection.execute(
+            """CREATE TABLE monitoring_runs (
+                run_id INTEGER PRIMARY KEY,
+                watch_id TEXT NOT NULL REFERENCES watches (watch_id),
+                observed_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX runs_by_watch_time
+               ON monitoring_runs (watch_id, observed_at, run_id)"""
+        )
+        connection.execute(
+            """ALTER TABLE fare_observations ADD COLUMN run_id INTEGER
+               REFERENCES monitoring_runs (run_id)"""
+        )
+        connection.execute(
+            """CREATE UNIQUE INDEX observation_per_run_itinerary
+               ON fare_observations (run_id, itinerary_id)
+               WHERE run_id IS NOT NULL"""
+        )
+        # ADD COLUMN cannot declare a composite foreign key. These triggers
+        # enforce run/watch membership without rebuilding the legacy table.
+        for event, suffix in (("INSERT", "insert"), ("UPDATE", "update")):
+            connection.execute(
+                f"""CREATE TRIGGER observation_run_watch_{suffix}
+                    BEFORE {event} ON fare_observations
+                    WHEN NEW.run_id IS NOT NULL AND NOT EXISTS (
+                        SELECT 1 FROM monitoring_runs
+                        WHERE run_id = NEW.run_id AND watch_id = NEW.watch_id
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'Observation watch must match run');
+                    END"""
+            )
+        connection.execute("PRAGMA user_version = 2")
+
+    @staticmethod
+    def _record_watch(connection: sqlite3.Connection, watch: FareWatch) -> None:
+        connection.execute(
+            """INSERT INTO watches (watch_id, context_json, currency)
+               VALUES (?, ?, ?) ON CONFLICT(watch_id) DO NOTHING""",
+            (watch.watch_id, watch.model_dump_json(), watch.currency),
+        )
+
+    def create_run(self, watch: FareWatch, *, observed_at: datetime) -> MonitoringRun:
+        """Create one distinct check; callers reuse its result for all its fares.
+
+        observed_at is required and must be timezone-aware. Ordering uses its
+        UTC value, then database-local run_id, independently of observation writes.
+        """
+        watch = FareWatch.model_validate(watch.model_dump())
+        run = MonitoringRun(run_id=1, watch_id=watch.watch_id, observed_at=observed_at)
+        with self._connect() as connection:
+            self._record_watch(connection, watch)
+            cursor = connection.execute(
+                "INSERT INTO monitoring_runs (watch_id, observed_at) VALUES (?, ?)",
+                (run.watch_id, run.observed_at.isoformat(timespec="microseconds")),
+            )
+            return run.model_copy(update={"run_id": cursor.lastrowid})
+
+    @staticmethod
+    def _validate_run(
+        connection: sqlite3.Connection, watch: FareWatch, run: MonitoringRun
+    ) -> MonitoringRun:
+        run = MonitoringRun.model_validate(run.model_dump())
+        if run.watch_id != watch.watch_id:
+            raise ValueError("Run must match the watch")
+        row = connection.execute(
+            "SELECT * FROM monitoring_runs WHERE run_id = ?", (run.run_id,)
+        ).fetchone()
+        if row is None or MonitoringRun.model_validate(dict(row)) != run:
+            raise ValueError("Run must match a persisted run in this repository")
+        return run
 
     def record_observation(
         self,
@@ -95,15 +178,22 @@ class SQLiteFareHistory:
         itinerary: RoundTripItinerary,
         *,
         observed_at: datetime | None = None,
+        run: MonitoringRun | None = None,
     ) -> FareObservation:
-        """Record one complete fare; repeated calls intentionally append records.
+        """Record one complete fare, optionally belonging to an explicit run.
 
-        Timestamp defaults to now in UTC; explicit naive timestamps are rejected.
+        With a run, its timestamp is used; an explicit timestamp must equal it.
+        Equal fares/details for the same run/itinerary reuse the stored record
+        (Decimal scale differences count as equal); conflicts raise ValueError.
+        Without a run, append ungrouped records excluded from run-aware history.
+        Ungrouped timestamps default to now; naive timestamps are rejected.
         Validates route/currency against the watch. The caller supplies dates via
         the watch because current normalized itineraries do not carry dates.
         """
         watch = FareWatch.model_validate(watch.model_dump())
         itinerary = RoundTripItinerary.model_validate(itinerary.model_dump())
+        if run is not None:
+            run = MonitoringRun.model_validate(run.model_dump())
         if (
             itinerary.outbound.origin != watch.origin
             or itinerary.outbound.destination != watch.destination
@@ -115,21 +205,44 @@ class SQLiteFareHistory:
         observation = FareObservation(
             **itinerary.model_dump(),
             observation_id=1,
+            run_id=run.run_id if run is not None else None,
             watch_id=watch.watch_id,
             itinerary_id=itinerary_identity(watch, itinerary),
-            observed_at=observed_at if observed_at is not None else datetime.now(UTC),
+            observed_at=(
+                observed_at
+                if observed_at is not None
+                else run.observed_at
+                if run is not None
+                else datetime.now(UTC)
+            ),
         )
         with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO watches (watch_id, context_json, currency)
-                   VALUES (?, ?, ?) ON CONFLICT(watch_id) DO NOTHING""",
-                (watch.watch_id, watch.model_dump_json(), watch.currency),
-            )
+            # Serialize duplicate lookup and insertion, including across writers.
+            connection.execute("BEGIN IMMEDIATE")
+            if run is not None:
+                self._validate_run(connection, watch, run)
+                if observation.observed_at != run.observed_at:
+                    raise ValueError("Observation timestamp must match the run")
+                existing = connection.execute(
+                    """SELECT * FROM fare_observations
+                       WHERE run_id = ? AND itinerary_id = ?""",
+                    (run.run_id, observation.itinerary_id),
+                ).fetchone()
+                if existing is not None:
+                    stored = self._observation(existing)
+                    if stored.model_dump(exclude={"observation_id"}) != (
+                        observation.model_dump(exclude={"observation_id"})
+                    ):
+                        raise ValueError(
+                            "Conflicting observation for run and itinerary"
+                        )
+                    return stored
+            self._record_watch(connection, watch)
             cursor = connection.execute(
                 """INSERT INTO fare_observations (
                     watch_id, observed_at, total_price, currency, itinerary_id,
-                    outbound_json, inbound_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    outbound_json, inbound_json, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     observation.watch_id,
                     observation.observed_at.isoformat(timespec="microseconds"),
@@ -138,6 +251,7 @@ class SQLiteFareHistory:
                     observation.itinerary_id,
                     observation.outbound.model_dump_json(),
                     observation.inbound.model_dump_json(),
+                    observation.run_id,
                 ),
             )
             return observation.model_copy(update={"observation_id": cursor.lastrowid})
@@ -174,6 +288,7 @@ class SQLiteFareHistory:
     def _observation(row: sqlite3.Row) -> FareObservation:
         return FareObservation(
             observation_id=row["observation_id"],
+            run_id=row["run_id"],
             watch_id=row["watch_id"],
             observed_at=row["observed_at"],
             total_price=Decimal(row["total_price"]),
@@ -197,4 +312,65 @@ class SQLiteFareHistory:
         return calculate_price_statistics(
             self.get_recent_observations(watch, itinerary_id=itinerary_id),
             currency=watch.currency,
+        )
+
+    def get_prior_observations(
+        self,
+        watch: FareWatch,
+        *,
+        before_run: MonitoringRun,
+        itinerary_id: str | None = None,
+    ) -> list[FareObservation]:
+        """Known-run history strictly before (run timestamp, run ID).
+
+        Excludes the entire current run, later runs, and all null-run records.
+        Returns oldest runs first, then observation ID within a run. Omitting
+        itinerary_id includes every itinerary in the watch, even if none recur.
+        Records within a run are alternatives, not temporal price changes.
+        """
+        watch = FareWatch.model_validate(watch.model_dump())
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            run = self._validate_run(connection, watch, before_run)
+            query = """SELECT o.* FROM fare_observations AS o
+                       JOIN monitoring_runs AS r ON o.run_id = r.run_id
+                           AND o.watch_id = r.watch_id
+                       WHERE r.watch_id = ? AND (r.observed_at, r.run_id) < (?, ?)"""
+            parameters: list[str | int] = [
+                watch.watch_id,
+                run.observed_at.isoformat(timespec="microseconds"),
+                run.run_id,
+            ]
+            if itinerary_id is not None:
+                query += " AND o.itinerary_id = ?"
+                parameters.append(itinerary_id)
+            query += " ORDER BY r.observed_at, r.run_id, o.observation_id"
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._observation(row) for row in rows]
+
+    def get_prior_run_statistics(
+        self,
+        watch: FareWatch,
+        *,
+        before_run: MonitoringRun,
+        itinerary_id: str | None = None,
+    ) -> PriorRunPriceStatistics:
+        """Observation-weighted aggregates from a single prior-history snapshot.
+
+        Reuses exact Decimal sums and half-even average rounding from existing
+        statistics. No preceding candidate is presented as a previous-run fare.
+        """
+        observations = self.get_prior_observations(
+            watch, before_run=before_run, itinerary_id=itinerary_id
+        )
+        stats = calculate_price_statistics(observations, currency=watch.currency)
+        return PriorRunPriceStatistics(
+            before_run=MonitoringRun.model_validate(before_run.model_dump()),
+            currency=stats.currency,
+            itinerary_id=itinerary_id,
+            observation_count=stats.observation_count,
+            run_count=len({item.run_id for item in observations}),
+            minimum_price=stats.minimum_price,
+            maximum_price=stats.maximum_price,
+            average_price=stats.average_price,
         )

@@ -383,15 +383,19 @@ from faresentry.persistence import SQLiteFareHistory
 
 history = SQLiteFareHistory(Path("fares.sqlite3"))
 watch = FareWatch.from_query(query)
-observation = history.record_observation(
-    watch, selected_trip, observed_at=datetime.now(UTC)
-)
+run = history.create_run(watch, observed_at=datetime.now(UTC))
+observation = history.record_observation(watch, selected_trip, run=run)
 recent = history.get_recent_observations(watch, limit=20)
 lowest = history.get_lowest_price(watch)
 statistics = history.get_price_statistics(watch)
 same_itinerary = history.get_price_statistics(
     watch, itinerary_id=observation.itinerary_id
 )
+prior_watch = history.get_prior_observations(watch, before_run=run)
+prior_itinerary = history.get_prior_observations(
+    watch, before_run=run, itinerary_id=observation.itinerary_id
+)
+prior_statistics = history.get_prior_run_statistics(watch, before_run=run)
 ```
 
 The immutable watch uses a versioned SHA-256 hash of canonical origin,
@@ -405,7 +409,9 @@ itineraries currently lack dates.
 
 The `watches` table stores the watch ID, validated context JSON, and currency.
 `fare_observations` stores an insertion ID, watch ID, UTC observation timestamp,
-Decimal price text, currency, itinerary ID, and typed outbound/inbound JSON.
+Decimal price text, currency, itinerary ID, typed outbound/inbound JSON, and an
+optional run ID. `monitoring_runs` stores a database-local integer run ID, watch
+ID, and explicit UTC timestamp.
 These normalized directions retain flight numbers, airlines, airports, flight
 durations, and connections; stops and total durations are derived from them.
 No provider tokens, raw SerpApi dictionaries, credentials, or LLM responses are
@@ -414,14 +420,50 @@ directions, excluding price. It remains stable across price changes, but changes
 when durations/connections change. Without schedule timestamps in the current
 domain model, it cannot uniquely identify every scheduled flight.
 
-Explicit timestamps must be timezone-aware and are normalized to UTC with fixed
-microsecond precision; omission uses current UTC time. Reads sort by timestamp,
-then insertion ID for ties. `limit` selects the latest N observations and returns
-them in chronological order; omit it for all records. Repeated calls append
-observations, including identical prices/timestamps. Statistics count records,
-not distinct polling runs. With no itinerary filter, observations of different
-candidates in the same watch contribute equally; use `itinerary_id` for comparisons
-of the same normalized itinerary over time.
+Create one run per search/check and pass the same run to every observation from
+that check. `create_run()` requires a timezone-aware timestamp and normalizes it
+to UTC. Runs order by `(observed_at, run_id)`; timestamp ties use run ID and
+backdated runs sort by their explicit timestamp, regardless of when their fares
+are inserted. Run objects must match persisted metadata in the repository and
+belong to the observation's watch. Run-bound observations use the run timestamp;
+an explicitly supplied observation timestamp must represent that same instant.
+
+There is one canonical observation per `(run_id, itinerary_id)`. Repeating the
+same normalized itinerary and numerically equal Decimal fare returns the original
+record, preserving its ID and Decimal representation. A conflicting fare or
+details under that identity raises `ValueError`; a mismatched currency is rejected.
+The identity helper derives itinerary IDs from normalized directions, so changed
+flight/duration/connection details normally identify a different itinerary.
+Duplicate lookup and insertion are transactional, with a unique index enforcing
+the rule across concurrent writers.
+
+For backwards compatibility, `record_observation()` without a run still appends
+ungrouped observations, defaulting the timestamp to now in UTC. These have null
+run membership and cannot be used as run-aware alert history. No run boundaries
+are inferred from timestamps, insertion IDs, itinerary IDs, or prices.
+
+`get_prior_observations(watch, before_run=run)` includes only known runs strictly
+preceding the supplied run. It excludes every observation in the current run,
+later runs, and all null-run records. Results order by run timestamp, run ID,
+then observation ID within each run. Use `itinerary_id` for same-itinerary history;
+omit it for whole-watch history across different itineraries. The itinerary does
+not need to recur in another run. Within-run records are alternatives, not
+temporal fare changes. Each query reads one database snapshot; runs are not
+finalized batches, so later writes to an earlier run can change future queries.
+
+`get_prior_run_statistics()` accepts the same scope and returns
+`PriorRunPriceStatistics`: the boundary run, currency, itinerary filter, observation
+count, represented run count, minimum, maximum, and average. Empty runs do not
+contribute to run count. Each canonical observation counts once, so watch-level
+averages are observation-weighted, not run-weighted. No arbitrary candidate is
+designated as the previous run's fare. Empty scopes return zero counts and null
+prices. This API does not compare the current fare or make alert decisions.
+
+The original `get_recent_observations()`, `get_lowest_price()`, and
+`get_price_statistics()` retain their record-based semantics, including ungrouped
+history. Recent reads sort by observation timestamp then insertion ID; `limit`
+selects the latest N observations and returns them oldest first. These APIs do
+not establish temporal run boundaries.
 
 Statistics expose count, minimum, maximum, average, current price, previous price,
 historical low, and signed current-minus-reference differences. Current is the
@@ -440,11 +482,13 @@ precision. Results do not depend on the caller's Decimal precision or rounding.
 Queries currently load their scoped history into memory, appropriate for the
 initial local store.
 
-Schema version 1 is tracked with `PRAGMA user_version`. Initialization and each
-record operation are transactional; foreign keys enforce watch/currency matching,
-and indexes support watch/itinerary time ordering. An empty version-0 database is
-initialized, while nonempty unversioned databases and unsupported versions are
-rejected without modification. Future migrations must explicitly transform data
-in a transaction and then update the version. The existing `.gitignore` excludes
+Schema version 2 is tracked with `PRAGMA user_version`. Version 1 is migrated
+transactionally by adding the run table, nullable observation membership, indexes,
+and watch/run consistency triggers. All existing observations remain unchanged
+with null run membership; no legacy runs are invented. Initialization/migration
+is repeatable, and a failure rolls back both schema changes and the version.
+Foreign keys enforce watch/currency and run existence. An empty version-0 database
+is initialized, while nonempty unversioned databases and unsupported versions are
+rejected without modification. The existing `.gitignore` excludes
 `*.db` and `*.sqlite3`. No automatic recording, alert decisions, scheduling, or
 provider/agent behavior is added.
