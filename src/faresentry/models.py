@@ -2,13 +2,80 @@
 
 from datetime import date
 from decimal import Decimal
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
 
 AirportCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
 CurrencyCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
 FlightLabel = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+TravelDirection = Literal["outbound", "inbound"]
+ConstraintType = Literal[
+    "max_stops_per_direction",
+    "max_duration_minutes_per_direction",
+    "max_connection_duration_minutes",
+    "allow_airport_transfers",
+]
+
+
+class HardTravelConstraints(BaseModel):
+    """Inclusive limits applied independently to both directions.
+
+    None disables a numeric limit. Durations are in whole minutes; total
+    direction duration includes all flights and connections. Airport transfers
+    are allowed by default, so an empty configuration imposes no restrictions.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_stops_per_direction: int | None = Field(default=None, ge=0, strict=True)
+    max_duration_minutes_per_direction: int | None = Field(
+        default=None, ge=0, strict=True
+    )
+    max_connection_duration_minutes: int | None = Field(default=None, ge=0, strict=True)
+    allow_airport_transfers: bool = Field(default=True, strict=True)
+
+
+class ConstraintViolation(BaseModel):
+    """A failed rule; connection_index is zero-based within its direction.
+
+    Numeric values use stops or minutes according to constraint_type. For
+    allow_airport_transfers, actual_value=True means a transfer is present
+    and allowed_value=False means transfers are prohibited.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    constraint_type: ConstraintType
+    direction: TravelDirection
+    actual_value: StrictInt | StrictBool
+    allowed_value: StrictInt | StrictBool
+    explanation: FlightLabel
+    connection_index: int | None = Field(default=None, ge=0, strict=True)
+
+
+class ConstraintEvaluation(BaseModel):
+    """All failures from an evaluation, with a consistent pass/fail flag."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    passes: bool = Field(strict=True)
+    violations: tuple[ConstraintViolation, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_passes(self) -> Self:
+        if self.passes != (not self.violations):
+            raise ValueError("passes must be true exactly when there are no violations")
+        return self
 
 
 class FlightSegment(BaseModel):
