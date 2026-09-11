@@ -11,7 +11,145 @@ uses prior-run history and explicit policy to decide which opportunities to
 surface. `run_monitoring_cycle()` connects these components for one complete
 watch check with bounded return lookups. A sequential local scheduler runs due
 watches; a separate notification service delivers approved alerts through Amazon
-SES email. Frontend and AWS infrastructure deployment are not implemented.
+SES email. A local Streamlit page presents deterministic demo scenarios and
+optional live checks. AWS infrastructure deployment is not implemented.
+
+## Local hackathon demo
+
+From this repository in Windows PowerShell:
+
+```powershell
+& .\.venv\Scripts\python.exe -m pip install -e '.[dev,ui]'
+& .\.venv\Scripts\python.exe -m streamlit run .\streamlit_app.py --server.address=127.0.0.1
+```
+
+Open `http://127.0.0.1:8501` in your browser. Stop the server with Ctrl+C.
+The optional `ui` extra installs Streamlit; no separate frontend build or API
+server is needed. This command binds to loopback; the checked-in Streamlit
+configuration disables local usage telemetry and browser error details.
+Installing only `.[dev]` keeps backend development
+independent of Streamlit; rendering tests skip when the UI extra is absent.
+
+**Demo Mode is the default and uses synthetic fares, a scripted recommender,
+and simulated notification delivery. It never calls SerpApi, Bedrock, or SES
+and requires no credentials.** Pick a scenario and click **Run FareSentry Check**:
+
+- **Routine check:** the selected nonstop fare stays at USD 1,000. With a USD 100
+  improvement threshold, the real alert evaluator keeps the traveler undisturbed.
+- **Worthwhile opportunity:** the same fare drops from USD 1,000 to USD 800.
+  The existing alert evaluator approves an alert and the fake email provider
+  receives one notification.
+
+Both scenarios use a fixed LAX–SIN watch, synthetic December 2026 travel dates,
+and a fixed September 2026 check clock. A cheaper two-stop trip fails the hard
+stop limit; the remaining nonstop and one-stop options reach the scripted
+recommender. The presets are fixed so the story stays repeatable. The page shows
+constraints, soft preferences, pipeline counts, selected travel details,
+recommendation, policy checks, notification outcome, recent observations, and
+cadence status after the check. A completed silent check is a successful outcome.
+
+Every demo click builds a prior completed monitoring cycle and a current due
+scheduler pass through the existing application services. Its temporary SQLite
+database is removed afterward. Demo setup never takes a live database path.
+The last result remains in browser session state; changing controls or rerendering
+does not repeat checks. Reloading the browser can reset that session state.
+
+**Live Mode is optional and disabled by default.** To enable it locally, run
+`$env:FARESENTRY_ENABLE_LIVE = "1"` before launching Streamlit. Export these settings
+in the PowerShell session launching Streamlit: `SERPAPI_API_KEY`, `AWS_PROFILE`, `AWS_REGION`, and
+`FARESENTRY_BEDROCK_MODEL_ID`. Use the AWS login/model setup below, including
+`aws login --profile faresentry` and region `us-west-2`. This page reads exported
+environment variables; it does not automatically load `.env`. Never put AWS
+credentials in `.env` or source code. Missing settings produce a not-ready message;
+authentication/service permission failures produce a safe failure message.
+
+Submit the compact trip form with **Run live FareSentry check** to perform one
+manual check using real SerpApi and Bedrock. This can incur service charges.
+The form creates the existing validated domain models. The first observation
+stays silent; later checks use the configured improvement threshold. Manual checks
+run when requested regardless of cadence. The page does not run a background loop.
+
+Live UI observations and known-success email receipts use the dedicated local
+`.faresentry-ui/live.sqlite3` file, covered by the existing SQLite ignore rule.
+This file survives UI restarts; watch preferences and complete results are only
+session-local. Raw recent history may show observations from incomplete checks;
+only completed, eligible history contributes to alert decisions.
+
+Live checks never automatically send email. If a result approves an alert, a
+separate **Send this approved alert by real email** button uses the existing
+notification service and SES configuration (`FARESENTRY_EMAIL_FROM` and
+`FARESENTRY_EMAIL_TO`; verified identities as documented below). It operates on
+the displayed submitted result, not unsaved form edits. Successful duplicates
+are suppressed by the existing run receipt. Delivery failure preserves the check
+result; an explicit retry after an uncertain send can duplicate an email.
+No live checks or real sends are required for tests or the demo.
+
+This is a single-user local demo, with one sequential caller per live database.
+Use one active Live Mode browser session and do not run another scheduler against
+that file concurrently. Authentication, production deployment, persistent user
+configuration, background UI workers, and advanced product features remain deferred.
+
+## Public hackathon deployment (Streamlit Community Cloud)
+
+Repository preparation targets **Streamlit Community Cloud**, with
+`streamlit_app.py` as the entry point. Demo Mode requires **no secrets** and uses
+synthetic deterministic fares, scripted recommendations, and simulated email.
+The real SerpApi, Bedrock, and SES integrations have been validated locally;
+keep them disabled on the public app.
+
+### Publish manually
+
+1. Commit and push the accepted application and these deployment files to
+   `zhiweim/FareSentry` on GitHub, branch `main`. Include `src/`, `pyproject.toml`,
+   `requirements.txt`, `streamlit_app.py`, and `.streamlit/config.toml`.
+   Do not include `.env`, AWS credentials, local databases, or
+   `.streamlit/secrets.toml` (ignored).
+2. Sign in at [Streamlit Community Cloud](https://share.streamlit.io/) and connect
+   your GitHub account with access to this repository. Choose **Create app**,
+   then **Yup, I have an app**.
+3. Select repository **zhiweim/FareSentry**, branch **main**, and main file path
+   **streamlit_app.py**. Choose an available app subdomain if desired.
+4. In **Advanced settings**, explicitly select **Python 3.13**. Leave **Secrets
+   empty**, including `FARESENTRY_ENABLE_LIVE`. Save and click **Deploy**.
+5. In the app's sharing settings, ensure **This app is public and searchable**
+   is selected. Open its assigned `https://<subdomain>.streamlit.app` URL in a
+   signed-out/private browser window to verify judges need no login.
+   See [public sharing settings](https://docs.streamlit.io/deploy/streamlit-community-cloud/share-your-app).
+6. Click **Run FareSentry Check** for **Routine check · stay silent** and verify
+   **Completed + silent**. Select **Worthwhile opportunity · alert**, run again,
+   and verify USD 1,000 → USD 800 and **Simulated notification delivered**.
+   Share that URL with the judges.
+
+Community Cloud supports maintained Python releases, including 3.13; its
+runtime is selected in Advanced settings, not by this repository's pyenv
+`.python-version`. See the [platform deployment instructions](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy).
+The root `requirements.txt` contains only `.[ui]`: it installs FareSentry and
+the Streamlit extra from `pyproject.toml`, without duplicating dependencies or
+installing development tools. Community Cloud prioritizes this file over
+`pyproject.toml` and installs from the repository root. No Docker image, system
+packages, AWS login, or PowerShell startup script is needed. See
+[dependency installation](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies).
+
+The shared Streamlit configuration leaves network binding to the host. The app
+also sets `client.showErrorDetails` to `"none"` at startup so browser tracebacks
+stay hidden even if the host overrides the file with its older boolean setting.
+The local launch command above explicitly uses loopback. Community Cloud enforces
+some settings, including usage statistics; the local telemetry setting does not
+override the host's policy. See [platform limitations](https://docs.streamlit.io/deploy/streamlit-community-cloud/status).
+
+Live controls and live facade actions require `FARESENTRY_ENABLE_LIVE=1`.
+Leave it unset on Community Cloud even if other configuration is present.
+Enabling Live Mode is intended only for the local, single-user workflow above;
+this milestone does not support hosting live credentials or shared live SQLite.
+
+Every demo click creates and removes its own temporary SQLite database. Sessions
+do not share demo history; a restart, sleep/wake, or new session can reset the
+visible result, but running either scenario reconstructs the same baseline.
+The host's local disk is not treated as durable storage. Community Cloud may
+sleep when idle and has shared resource limits, so a cold page may need time to
+wake. There is no background monitoring while the app sleeps. Authentication,
+durable user/watch storage, distributed scheduling, scaling, and production
+operations remain deferred. No public URL is created by repository preparation.
 
 ## Local setup (Windows PowerShell)
 

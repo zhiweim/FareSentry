@@ -1,0 +1,16 @@
+[server]
+headless = true
+
+[client]
+showErrorDetails = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#176E68"
+backgroundColor = "#F6F8FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#15233B"
+font = "sans serif"

@@ -1,6 +1,7 @@
 .venv/
 .venv-python314-backup/
 .env
+.streamlit/secrets.toml
 __pycache__/
 .pytest_cache/
 .ruff_cache/
