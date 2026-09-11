@@ -9,8 +9,9 @@ soft preferences and deterministic facts. A local SQLite repository stores fare
 observations and computes deterministic history statistics. A pure alert evaluator
 uses prior-run history and explicit policy to decide which opportunities to
 surface. `run_monitoring_cycle()` connects these components for one complete
-watch check with bounded return lookups. Frontend, notifications, and AWS
-infrastructure are not implemented.
+watch check with bounded return lookups. A sequential local scheduler runs due
+watches; a separate notification service delivers approved alerts through Amazon
+SES email. Frontend and AWS infrastructure deployment are not implemented.
 
 ## Local setup (Windows PowerShell)
 
@@ -493,13 +494,17 @@ precision. Results do not depend on the caller's Decimal precision or rounding.
 Queries currently load their scoped history into memory, appropriate for the
 initial local store.
 
-Schema version 3 is tracked with `PRAGMA user_version`. Version 1 is migrated
+Schema version 4 is tracked with `PRAGMA user_version`. Version 1 is migrated
 transactionally by adding the run table, nullable observation membership, indexes,
 and watch/run consistency triggers, followed by the version-3 completion marker.
 Version 2 migrates by adding `completed INTEGER NOT NULL DEFAULT 0` constrained to
 0 or 1. All preexisting v2 runs are marked completed to preserve existing history;
 new runs default to incomplete. Observations are unchanged, and v1 observations
-retain null run membership; no legacy runs are invented. Initialization/migration
+retain null run membership; no legacy runs are invented. Version 3 advances to 4
+by adding `notification_deliveries`, keyed by monitoring run, without changing
+existing watches, observations, or completion flags. It stores only a UTC delivery
+timestamp, provider name, and provider message ID. No email bodies or addresses
+are stored. Earlier schemas pass through these migrations in order. Initialization/migration
 is repeatable, and a failure rolls back both schema changes and the version.
 Foreign keys enforce watch/currency and run existence. An empty version-0 database
 is initialized, while nonempty unversioned databases and unsupported versions are
@@ -602,7 +607,7 @@ The reference semantics are explicit:
 For example, a newly recommended $975 itinerary can meet a $1,000 target even if
 the prior watch low was $950. It needs no same-itinerary history. Without another
 trigger, unchanged fares and price increases do not alert. Target hits may alert
-again on a later run; this foundation has no delivery state or notification log.
+again on a later run; delivery deduplication is per run, not across distinct runs.
 Repeated evaluation of identical data deliberately returns the identical decision.
 
 `AlertDecision` contains immutable source facts and policy. Arithmetic, seven
@@ -614,7 +619,7 @@ trigger. Ordinary JSON serialization includes all computed fields and serializes
 Decimal values as strings. Use `model_dump_json(round_trip=True)` to save source
 state that can be reloaded with `AlertDecision.model_validate_json()`; derived
 fields are then recomputed. Alert numeric inputs reject floats, booleans, and
-nonfinite values. No scheduling or notification delivery is implemented.
+nonfinite values. Scheduling and delivery consume these decisions separately.
 
 ## One monitoring cycle
 
@@ -720,7 +725,7 @@ A watch is due when enabled and either no monitoring run exists or elapsed UTC
 time since its latest run's creation is at least its check interval. Cadence uses
 **attempt time**, including incomplete, failed, empty, and manually initiated
 runs. It uses `SQLiteFareHistory.get_latest_run()`, ordered by timestamp then run
-ID, without changing schema v3. This is separate from alert history, which still
+ID. This is separate from alert history, which still
 excludes incomplete runs. Long downtime produces one check, not a catch-up burst.
 
 Using the configured `query`, `constraints`, `preferences`, `provider`, `history`,
@@ -781,5 +786,115 @@ schedulers, distributed locking, cron expressions, advanced retries, and persist
 user configuration are deferred. Tests inject `clock`, a scripted `monitoring_cycle`,
 and/or provider/recommender fakes. `poll(sleep=fake_sleep, max_polls=4)` bounds polling
 without real waiting; `max_polls=0` performs no passes. Existing HTTP/AWS blockers
-remain active. Notification delivery and deployment are not implemented; even a
-true `should_alert` is only returned in the result.
+remain active. The scheduler returns `should_alert` in the result; the separate
+service below handles delivery. Deployment remains deferred.
+
+## Email notification delivery
+
+`faresentry.notifications.NotificationService.handle_monitoring_result(watch, result)`
+delivers an existing approved alert. `MonitoringRunResult` already supplies the
+selected itinerary, recommendation, and structured alert facts; `FareWatch` adds
+trip dates. Formatting is deterministic plain text, with route, dates, fare,
+available historical comparisons, stops/durations, satisfied alert reasons, and
+the recommendation's display explanation. It makes no flight or model calls and
+does not decide whether an opportunity deserves an alert.
+
+The operation returns a typed `NotificationOutcome`:
+
+- `not_applicable`: no alert decision; zero provider calls.
+- `not_needed`: `should_alert=False`; zero provider calls.
+- `delivered`: `should_alert=True`, provider accepted the email, and SQLite stored
+  the successful receipt. This confirms provider acceptance, not inbox arrival.
+- `already_delivered`: this run already has a successful receipt; zero provider calls.
+- `failed`: validation, history lookup, provider sending, or receipt recording
+  failed. `failure_stage` and `error_type` identify the failure without raw exceptions.
+
+Delivery validates that the run belongs to the watch and is already completed.
+A notification failure never changes monitoring completion, observations, or
+`AlertDecision`. The `NotificationProvider.send(NotificationMessage)` abstraction
+returns a typed `DeliveryReceipt`; only `providers.ses.SESEmailProvider` builds
+SES request dictionaries.
+
+There is one successful email receipt per monitoring run. Deduplication survives
+repository/process reconstruction and applies even if the configured destination
+changes. A distinct later run can send its own approved alert. Use one sequential
+caller per database, as with the scheduler; concurrent delivery workers are unsupported.
+
+**Network ambiguity:** SES may accept a message but its response can be lost, or
+the process/SQLite write can fail before success is recorded. There is then no
+durable receipt; explicitly retrying the same result can send a duplicate. This
+is not exactly-once delivery. SES SDK retries are disabled in this adapter, and
+the service has no automatic retries. A `recording` failure means provider
+acceptance returned but local success was not recorded. Inspect failures before
+explicitly calling the operation again. Only successful receipts are persisted;
+pending messages and full monitoring results are not stored for restart recovery.
+Queues, outboxes, advanced retries, bounce tracking, multiple channels, and
+distributed delivery remain deferred.
+
+### SES configuration
+
+Use the existing standard AWS credential mechanisms (for example `aws login`
+or a configured profile). Do not put AWS credentials in code or `.env`.
+Configure the single sender/recipient and region in PowerShell:
+
+```powershell
+$env:FARESENTRY_EMAIL_FROM = "verified-sender@example.com"
+$env:FARESENTRY_EMAIL_TO = "traveler@example.com"
+$env:AWS_REGION = "us-west-2"
+# Optional: select an existing AWS profile.
+$env:AWS_PROFILE = "your-profile"
+```
+
+Both addresses must be single plain ASCII email addresses. If `AWS_REGION` is
+unset, Boto3 uses its normal region configuration, including `AWS_DEFAULT_REGION`
+or the selected profile. The adapter creates the SES client only on delivery.
+The selected AWS identity needs `ses:SendEmail` permission. Verify the sender
+identity in SES; while the account is in the SES sandbox, also verify the
+recipient. Identities and sandbox status are region-specific. Configure these
+in AWS yourself; FareSentry does not change account-level settings. See the
+[SES SendEmail documentation](https://docs.aws.amazon.com/boto3/latest/reference/services/ses/client/send_email.html)
+and [SES region guidance](https://docs.aws.amazon.com/ses/latest/dg/regions.html).
+
+### Deliver one result or use the autonomous loop
+
+Using `history`, `result`, and `scheduled_watch` from the examples above:
+
+```python
+from faresentry.notifications import NotificationService
+from faresentry.providers.ses import SESEmailProvider
+
+notifications = NotificationService(
+    history=history,
+    provider=SESEmailProvider.from_environment(),
+)
+outcome = notifications.handle_monitoring_result(scheduled_watch.watch, result)
+print(outcome.model_dump_json(indent=2))
+
+# Alternatively, consume each scheduler pass in the same sequential local loop.
+watch_contexts = {scheduled_watch.watch.watch_id: scheduled_watch.watch}
+for batch in scheduler.poll(poll_interval_seconds=60):
+    print(batch.model_dump_json(indent=2))
+    outcomes = notifications.handle_scheduler_result(batch, watches=watch_contexts)
+    for outcome in outcomes:
+        print(outcome.model_dump_json(indent=2))
+```
+
+`handle_scheduler_result` is the thin application boundary after a scheduling
+pass. Monitoring finishes for all due watches first; then each successful result
+is handled independently. Failed/skipped monitoring outcomes never send. A mail
+failure does not prevent other watch deliveries or subsequent polls, and the
+original batch retains every successful `MonitoringRunResult`. Include all
+configured watches in `watch_contexts` when monitoring multiple watches.
+
+### Explicit manual transport smoke test
+
+After configuring AWS and verified addresses, intentionally invoke:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/send_test_email.py --send
+```
+
+This sends one fixed test email without a fare check or receipt persistence;
+each explicit invocation sends again. Omitting `--send` exits without sending.
+Automated tests mock SES and notification providers, block real HTTP/AWS calls,
+and use temporary SQLite databases and injected clocks. They never send email.

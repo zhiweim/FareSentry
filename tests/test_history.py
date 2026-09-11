@@ -73,17 +73,22 @@ def test_initialization_is_idempotent(tmp_path: Path) -> None:
     SQLiteFareHistory(path)
     SQLiteFareHistory(path)
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
-        } == {"watches", "fare_observations", "monitoring_runs"}
+        } == {
+            "watches",
+            "fare_observations",
+            "monitoring_runs",
+            "notification_deliveries",
+        }
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-@pytest.mark.parametrize("version", [4, 99])
+@pytest.mark.parametrize("version", [5, 99])
 def test_unknown_schema_is_not_overwritten(tmp_path: Path, version: int) -> None:
     path = tmp_path / "future.sqlite3"
     with closing(sqlite3.connect(path)) as connection:
@@ -790,7 +795,7 @@ def test_version_one_migrates_without_inventing_runs(
     repository = SQLiteFareHistory(version_one_database)
     SQLiteFareHistory(version_one_database)
     with closing(sqlite3.connect(version_one_database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("SELECT * FROM monitoring_runs").fetchall() == []
         rows = connection.execute("SELECT * FROM fare_observations").fetchall()
@@ -972,7 +977,7 @@ def test_v2_migration_preserves_history_and_defaults_new_runs_to_incomplete(
     repository = SQLiteFareHistory(version_two_database)
     SQLiteFareHistory(version_two_database)
     with closing(sqlite3.connect(version_two_database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert (
             connection.execute("SELECT * FROM fare_observations").fetchall() == original
@@ -1051,3 +1056,55 @@ def test_latest_run_uses_attempt_order_and_watch_scope(
     reopened = SQLiteFareHistory(repository.database_path)
     assert reopened.get_latest_run(watch) == future
     assert reopened.get_prior_observations(watch, before_run=future) == []
+
+
+@pytest.fixture
+def version_three_database(version_two_database: Path) -> Path:
+    with closing(sqlite3.connect(version_two_database)) as connection, connection:
+        SQLiteFareHistory._migrate_v2_to_v3(connection)
+        connection.execute("UPDATE monitoring_runs SET completed = 0 WHERE run_id = 2")
+    return version_two_database
+
+
+def test_v4_migration_preserves_all_history_and_completion(
+    version_three_database: Path,
+) -> None:
+    with closing(sqlite3.connect(version_three_database)) as connection:
+        original = {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("watches", "monitoring_runs", "fare_observations")
+        }
+    SQLiteFareHistory(version_three_database)
+    SQLiteFareHistory(version_three_database)
+    with closing(sqlite3.connect(version_three_database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        for table, rows in original.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+        assert (
+            connection.execute("SELECT * FROM notification_deliveries").fetchall() == []
+        )
+        assert connection.execute(
+            "SELECT completed FROM monitoring_runs ORDER BY run_id"
+        ).fetchall() == [(1,), (0,)]
+
+
+def test_v4_migration_rolls_back_table_and_version(
+    version_three_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with closing(sqlite3.connect(version_three_database)) as connection:
+        original = list(connection.iterdump())
+    migrate = SQLiteFareHistory._migrate_v3_to_v4
+
+    def fail(connection: sqlite3.Connection) -> None:
+        migrate(connection)
+        raise RuntimeError("migration failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SQLiteFareHistory, "_migrate_v3_to_v4", staticmethod(fail))
+        with pytest.raises(RuntimeError, match="migration failure"):
+            SQLiteFareHistory(version_three_database)
+    with closing(sqlite3.connect(version_three_database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert list(connection.iterdump()) == original
+    SQLiteFareHistory(version_three_database)

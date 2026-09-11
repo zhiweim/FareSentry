@@ -17,8 +17,9 @@ from faresentry.history import (
     itinerary_identity,
 )
 from faresentry.models import FlightItinerary, RoundTripItinerary
+from faresentry.notification_models import NotificationDelivery
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SQLiteFareHistory:
@@ -53,10 +54,12 @@ class SQLiteFareHistory:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == SCHEMA_VERSION:
                 return
-            if version in (1, 2):
+            if version in (1, 2, 3):
                 if version == 1:
                     self._migrate_v1_to_v2(connection)
-                self._migrate_v2_to_v3(connection)
+                if version in (1, 2):
+                    self._migrate_v2_to_v3(connection)
+                self._migrate_v3_to_v4(connection)
                 return
             if version != 0:
                 raise ValueError(f"Unsupported fare-history schema version: {version}")
@@ -97,6 +100,7 @@ class SQLiteFareHistory:
             connection.execute("PRAGMA user_version = 1")
             self._migrate_v1_to_v2(connection)
             self._migrate_v2_to_v3(connection)
+            self._migrate_v3_to_v4(connection)
 
     @staticmethod
     def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -154,6 +158,19 @@ class SQLiteFareHistory:
                VALUES (?, ?, ?) ON CONFLICT(watch_id) DO NOTHING""",
             (watch.watch_id, watch.model_dump_json(), watch.currency),
         )
+
+    @staticmethod
+    def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+        """Add successful email receipts without changing any watch/run/fare data."""
+        connection.execute(
+            """CREATE TABLE notification_deliveries (
+                run_id INTEGER PRIMARY KEY REFERENCES monitoring_runs (run_id),
+                delivered_at TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_message_id TEXT NOT NULL
+            )"""
+        )
+        connection.execute("PRAGMA user_version = 4")
 
     def create_run(self, watch: FareWatch, *, observed_at: datetime) -> MonitoringRun:
         """Create one incomplete check; callers reuse its result for all its fares.
@@ -218,6 +235,73 @@ class SQLiteFareHistory:
                 (watch.watch_id,),
             ).fetchone()
         return MonitoringRun.model_validate(dict(row)) if row is not None else None
+
+    @staticmethod
+    def _validate_notification_run(
+        connection: sqlite3.Connection, watch: FareWatch, run_id: int
+    ) -> None:
+        if type(run_id) is not int or run_id <= 0:
+            raise ValueError("run_id must be a positive integer")
+        row = connection.execute(
+            "SELECT watch_id, completed FROM monitoring_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None or row["watch_id"] != watch.watch_id or row["completed"] != 1:
+            raise ValueError(
+                "Notification requires a completed run belonging to the watch"
+            )
+
+    def get_notification_delivery(
+        self, watch: FareWatch, *, run_id: int
+    ) -> NotificationDelivery | None:
+        """Validate completed run/watch membership and look up its email receipt."""
+        watch = FareWatch.model_validate(watch.model_dump())
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            self._validate_notification_run(connection, watch, run_id)
+            row = connection.execute(
+                "SELECT * FROM notification_deliveries WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return (
+            NotificationDelivery.model_validate(dict(row)) if row is not None else None
+        )
+
+    def record_notification_delivery(
+        self, watch: FareWatch, delivery: NotificationDelivery
+    ) -> NotificationDelivery:
+        """Record provider acceptance; identical repeats reuse the original record.
+
+        Conflicting receipts raise ValueError. No email body or destination is
+        stored, and this operation never modifies monitoring completion or fares.
+        """
+        watch = FareWatch.model_validate(watch.model_dump())
+        delivery = NotificationDelivery.model_validate(delivery.model_dump())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_notification_run(connection, watch, delivery.run_id)
+            existing = connection.execute(
+                "SELECT * FROM notification_deliveries WHERE run_id = ?",
+                (delivery.run_id,),
+            ).fetchone()
+            if existing is not None:
+                stored = NotificationDelivery.model_validate(dict(existing))
+                if stored != delivery:
+                    raise ValueError(
+                        "Conflicting notification delivery for monitoring run"
+                    )
+                return stored
+            connection.execute(
+                """INSERT INTO notification_deliveries
+                   (run_id, delivered_at, provider, provider_message_id)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    delivery.run_id,
+                    delivery.delivered_at.isoformat(timespec="microseconds"),
+                    delivery.provider,
+                    delivery.provider_message_id,
+                ),
+            )
+        return delivery
 
     def record_observation(
         self,
