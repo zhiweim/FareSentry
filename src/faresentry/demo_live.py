@@ -42,7 +42,7 @@ def _live_dependencies() -> tuple[FlightProvider, Recommender]:
             model_id=os.environ["FARESENTRY_BEDROCK_MODEL_ID"],
             region_name=os.environ["AWS_REGION"],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=3000,
         )
     )
 
