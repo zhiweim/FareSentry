@@ -60,6 +60,32 @@ inventory assumed to remain bookable.
 
 ## Architecture
 
+> **AI chooses among acceptable options. Python decides whether the user should be interrupted.**
+
+```mermaid
+flowchart LR
+    A[Watch Configuration] --> B[Python<br/>Scheduler / Monitoring]
+    B --> C[SerpApi /<br/>Google Flights]
+    C --> D[Python<br/>Normalize · enforce hard constraints<br/>Deduplicate · compute facts]
+
+    A -. Soft preferences .-> E[Strands + Amazon Bedrock<br/>Subjective recommendation]
+    D -->|Current eligible candidates<br/>+ computed facts| E
+
+    E --> F[Python<br/>Validate recommendation<br/>Compare completed history · evaluate policy]
+    F --> G{Python<br/>should_alert?}
+
+    G -->|No| H[Stay silent]
+    G -->|Yes| I[Python<br/>Notification Service]
+    I --> J[Amazon SES]
+
+    K[(SQLite<br/>Persistence and history)]
+
+    D -. Observations + run state .-> K
+    K -. Cadence + completed history .-> F
+    K -. Cadence + run state .-> B
+    I -. Delivery receipts + dedupe .-> K
+```
+
 - **Deterministic Python:** validates models, calculates objective facts, enforces
   hard constraints, manages run/history state, evaluates alert policy, and gates
   notification delivery.
