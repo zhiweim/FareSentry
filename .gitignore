@@ -11,3 +11,38 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# FareSentry local runtime state
+.faresentry-ui/
+
+# Local databases and SQLite sidecars
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Repository-local AWS credentials/config
+.aws/
+
+# Private keys / certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime logs
+*.log
